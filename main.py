@@ -4,6 +4,9 @@ Interactive:      python main.py [--camera N] [--mute] [--record out.mp4]
 Self-test:        python main.py --selftest [seconds] [--visible] [--record out.mp4]
                   offscreen render + SYNTHETIC vision input; exits 0 when
                   render fps >= 55 and vision sample rate >= 20 Hz.
+Live-camera test: python main.py --selftest 20 --camera-live --camera 0 --visible
+                  same timed run, but vision comes from the real camera; the
+                  gate then checks the pipeline (status ok, >=20 Hz), not hands.
 """
 from __future__ import annotations
 
@@ -52,10 +55,11 @@ def main() -> int:
     from game.window import GameWindow
 
     app = QApplication(sys.argv)
-    # selftest uses synthetic vision input: no camera needed (regression mode)
-    # audio stays enabled (so the sfx backend is exercised) but muted: CI-quiet.
+    # selftest defaults to synthetic vision (no camera needed, regression mode);
+    # --camera-live keeps the timed run but feeds it the real camera instead.
+    live_camera = "--camera-live" in args
     win = GameWindow(
-        use_synthetic=selftest,
+        use_synthetic=selftest and not live_camera,
         camera_index=_camera_index(args),
         audio="--mute" not in args,
         record_path=_value(args, "--record"),
@@ -79,6 +83,8 @@ def main() -> int:
             print(f"SELFTEST seconds={s['seconds']:.1f} ticks={s['ticks']} paints={s['paints']}")
             print(f"SELFTEST avg tick fps={s['avg_tick_fps']:.1f} avg paint fps={s['avg_paint_fps']:.1f}")
             print(f"SELFTEST vision status={status} hz={vis_hz} samples={samples} infer_ms={infer_ms:.1f}")
+            if live_camera:
+                print(f"SELFTEST blades_now={len(blades)} (hands visible to the camera)")
             g = s["game"]
             print(f"SELFTEST trail_points={s['trail_points']}")
             print(f"SELFTEST audio={s['audio']} muted={s['muted']}")
@@ -93,18 +99,27 @@ def main() -> int:
             # spawn expectation scales with the run length: a 20 s run must see
             # a full wave or two, a 6 s smoke test only needs to prove the loop.
             spawn_needed = max(2, min(6, round(seconds / 4)))
-            ok = (
-                s["avg_paint_fps"] >= 55.0
-                and vis_hz >= 20
-                and s["trail_points"] >= 3
-                and g["spawned"] >= spawn_needed
-                and g["sliced"] >= 1
-            )
-            print(
-                "SELFTEST "
-                + ("PASS" if ok else "FAIL")
-                + f" (render>=55fps, vision>=20Hz, trail>=3pts, spawn>={spawn_needed}, slice>=1)"
-            )
+            if live_camera:
+                # nobody guarantees hands in frame during a timed run, so the
+                # live gate checks the pipeline (camera -> pose -> publish),
+                # not the player's hand gestures.
+                ok = (
+                    s["avg_paint_fps"] >= 55.0
+                    and vis_hz >= 20
+                    and status == "ok"
+                    and g["spawned"] >= spawn_needed
+                )
+                criteria = f"render>=55fps, vision>=20Hz status=ok, spawn>={spawn_needed} (live camera)"
+            else:
+                ok = (
+                    s["avg_paint_fps"] >= 55.0
+                    and vis_hz >= 20
+                    and s["trail_points"] >= 3
+                    and g["spawned"] >= spawn_needed
+                    and g["sliced"] >= 1
+                )
+                criteria = f"render>=55fps, vision>=20Hz, trail>=3pts, spawn>={spawn_needed}, slice>=1"
+            print("SELFTEST " + ("PASS" if ok else "FAIL") + f" ({criteria})")
             exit_code[0] = 0 if ok else 1
             app.quit()
 
