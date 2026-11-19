@@ -23,6 +23,7 @@ from .shared import PREVIEW_W, PREVIEW_H, BladePoint, SharedVisionState
 BLADE_PAIRS = ((17, 19), (18, 20))  # (pinky, index) per arm
 CAMERA_W, CAMERA_H = 1280, 720
 VISIBILITY_MIN = 0.5
+FIRST_FRAME_TIMEOUT_S = 1.5  # give a backend this long to deliver its first frame
 
 
 class VisionThread(QThread):
@@ -47,14 +48,25 @@ class VisionThread(QThread):
     # ---- setup helpers ----
 
     def _open_camera(self):
-        """Try DSHOW then MSMF, MJPG preferred, 1280x720@30 request."""
-        for backend in (cv2.CAP_DSHOW, cv2.CAP_MSMF):
+        """Open 1280x720@30, MSMF first then DSHOW.
+
+        Order matters: on the reference machine DSHOW tops out at ~10 fps while
+        MSMF reaches 30 fps on the same camera (docs/M0 report). A backend that
+        opens but never delivers a frame inside FIRST_FRAME_TIMEOUT_S is dropped,
+        so a broken MSMF stack still falls back to DSHOW.
+        """
+        for backend in (cv2.CAP_MSMF, cv2.CAP_DSHOW):
             cap = cv2.VideoCapture(self.camera_index, backend)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_W)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
-                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-                cap.set(cv2.CAP_PROP_FPS, 30)
+            if not cap.isOpened():
+                cap.release()
+                continue
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_W)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
+            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            cap.set(cv2.CAP_PROP_FPS, 30)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            deadline = time.monotonic() + FIRST_FRAME_TIMEOUT_S
+            while time.monotonic() < deadline:
                 ok, _ = cap.read()
                 if ok:
                     return cap

@@ -95,41 +95,57 @@ def bench_landmarker(delegate: str, model_path: Path) -> tuple[bool, str]:
 
 
 def camera_probe(index: int = 0, seconds: float = 4.0) -> None:
+    """Measure what each backend really delivers at 1280x720@30.
+
+    Both backends are probed because they differ wildly on some machines
+    (reference box: DSHOW ~10 fps, MSMF 30 fps). Brightness is reported too:
+    privacy tools can hand out an all-black fake stream instead of failing,
+    which looks "open" but is unusable.
+    """
     import cv2
 
     def measure(cap, label: str, secs: float) -> float:
-        got, first = 0, None
+        got, first, last = 0, None, None
+        brightness = -1.0
         deadline = time.perf_counter() + secs
         while time.perf_counter() < deadline:
-            ok, _ = cap.read()
+            ok, frame = cap.read()
             if ok:
                 got += 1
+                last = time.perf_counter()
                 if first is None:
                     first = time.perf_counter()
+                if frame is not None and got % 5 == 0:
+                    brightness = float(frame.mean())
         elapsed = time.perf_counter() - (first or deadline)
         fps = got / elapsed if got and elapsed > 0.2 else 0.0
         w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         reported = cap.get(cv2.CAP_PROP_FPS)
-        print(f"[camera] {label:<20} measured {fps:6.1f} fps @ {w}x{h} (driver reports {reported:.0f})")
+        verdict = "OK"
+        if fps < 20:
+            verdict = "SLOW"
+        if brightness == 0.0:
+            verdict = "BLACK-fake-stream"
+        print(
+            f"[camera] {label:<20} measured {fps:6.1f} fps @ {w}x{h} "
+            f"(driver reports {reported:.0f}) brightness {brightness:5.1f}  [{verdict}]"
+        )
         return fps
 
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-    if not cap.isOpened():
-        print(f"[camera] ERROR: cannot open camera index {index}")
-        return
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    measure(cap, "default settings", seconds)
-
-    cap.release()
-    cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 60)
-    measure(cap, "MJPG + fps=60 req", seconds)
-    cap.release()
+    for backend, name in ((cv2.CAP_MSMF, "MSMF"), (cv2.CAP_DSHOW, "DSHOW")):
+        cap = cv2.VideoCapture(index, backend)
+        if not cap.isOpened():
+            print(f"[camera] {name:<4} cannot open camera index {index}")
+            cap.release()
+            continue
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FPS, 30)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        measure(cap, f"{name} 1280x720@30", seconds)
+        cap.release()
     print("[camera] done")
 
 
