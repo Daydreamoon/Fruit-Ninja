@@ -12,7 +12,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 
-PREVIEW_W, PREVIEW_H = 240, 135  # 16:9 mini camera preview
+PREVIEW_W, PREVIEW_H = 240, 135  # camera preview sent to the render thread  # 16:9 mini camera preview
 
 
 @dataclass

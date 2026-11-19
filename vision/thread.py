@@ -22,8 +22,8 @@ from PySide6.QtCore import QThread
 from .shared import PREVIEW_W, PREVIEW_H, BladePoint, SharedVisionState
 
 BLADE_PAIRS = ((17, 19), (18, 20))  # (pinky, index) per arm
+VISIBILITY_MIN = 0.35  # 0.5 was too strict: hands in motion kept dropping out
 CAMERA_W, CAMERA_H = 1280, 720
-VISIBILITY_MIN = 0.5
 FIRST_FRAME_TIMEOUT_S = 1.5  # give a backend this long to deliver its first frame
 
 
@@ -177,6 +177,10 @@ class VisionThread(QThread):
                     for pinky_i, index_i in BLADE_PAIRS:
                         p, q = lms[pinky_i], lms[index_i]
                         if p.visibility > VISIBILITY_MIN and q.visibility > VISIBILITY_MIN:
+                            # raw, mirrored camera coordinates (0..1). Turning
+                            # them into screen positions is the render thread's
+                            # job: only it knows where this player's hands sit
+                            # (see the auto-calibration in game/window.py).
                             blades.append(
                                 BladePoint(
                                     x=(p.x + q.x) / 2,

@@ -6,6 +6,7 @@ SharedVisionState written by the vision thread and draws from it.
 from __future__ import annotations
 
 import math
+import sys
 import time
 
 from PySide6.QtCore import QRect, Qt, QTimer
@@ -31,6 +32,32 @@ from vision.thread import VisionThread
 GAME_W, GAME_H = 1280, 720
 DEMO_PUSH_PERIOD = 1.0 / 30.0  # trail demo feeds the trail at vision rate
 DEMO_BLADE_SPEED = 4200.0  # px/s — fast enough to reach a falling fruit
+
+# Camera-box -> screen mapping. The default maps most of the frame; a 3 second
+# auto-calibration at start-up shrinks it to the box the player's hands
+# actually move in, so a relaxed arm movement covers the whole screen instead
+# of demanding a dance across the field of view.
+CALIB_SECONDS = 3.0
+CALIB_MIN_SPAN = 0.10  # less movement than this in an axis = keep the default
+CALIB_PAD = 0.06  # margin around the measured box, as a fraction of the frame
+# A box smaller than this gets widened (centred on what was measured): a
+# player who calibrates with one hand only would otherwise push the other hand
+# into a clamp at the screen edge.
+CALIB_MIN_BOX = 0.50
+CALIB_DEFAULT = (0.10, 0.90, 0.06, 0.94)  # x0, x1, y0, y1
+CALIB_BANNER_S = 2.0  # keep the "done" note on screen this long
+
+
+def _widen(lo: float, hi: float, min_span: float) -> tuple[float, float]:
+    """Grow [lo, hi] to at least min_span, keeping it centred and inside 0..1."""
+    span = hi - lo
+    if span >= min_span:
+        return lo, hi
+    centre = (lo + hi) / 2
+    lo = max(0.0, centre - min_span / 2)
+    hi = min(1.0, lo + min_span)
+    lo = max(0.0, hi - min_span)
+    return lo, hi
 
 
 class GameWindow(QWidget):
@@ -70,6 +97,13 @@ class GameWindow(QWidget):
         self._trail_demo = use_synthetic
         self._demo_t = 0.0
         self._demo_acc = 0.0
+        self._last_blade_t = 0.0  # for the "no hand detected" hint
+        self._not_ready_since: float | None = None  # start-up clock for the hint
+        # auto-calibration of the camera->screen box (see _update_calibration)
+        self._calib_box: tuple[float, float, float, float] | None = None
+        self._calib_start_t: float | None = None
+        self._calib_done_t: float | None = None
+        self._calib_pts: list[tuple[float, float]] = []
         # scripted hands chase fruit, so the synthetic selftest slices reliably
         self._demo_pos = [(GAME_W * 0.5, GAME_H * 0.62), (GAME_W * 0.5, GAME_H * 0.38)]
 
@@ -117,6 +151,9 @@ class GameWindow(QWidget):
 
         self._pulse_t += dt
         self._vis = self.vision_shared.snapshot()
+        if self._vis[0]:
+            self._last_blade_t = now
+        self._update_calibration(now)
         self._feed_trails(dt)
 
         # --- M4 game step: physics/waves, then blade-vs-fruit collisions ---
@@ -124,6 +161,7 @@ class GameWindow(QWidget):
         # world until vision reports "ok" keeps the first round fair: no fruit is
         # spawned (and missed) while the player cannot see their own hands yet.
         if self._world_ready():
+            self._not_ready_since = None
             self.state.update(dt)
             if not self.state.game_over:
                 now = time.perf_counter()
@@ -132,6 +170,8 @@ class GameWindow(QWidget):
                     segs.extend(tr.collision_segments(now))
                 if segs:
                     self.state.collide_blade(segs)
+        elif self._not_ready_since is None:
+            self._not_ready_since = now  # start of the "still starting" clock
         self._flush_audio_events()
         self.update()
         if self.recorder is not None and self.recorder.status == "recording":
@@ -196,6 +236,53 @@ class GameWindow(QWidget):
             self._demo_pos[k] = (x, y)
             self._trails[k].push(x, y, now)
 
+    def _update_calibration(self, now: float) -> None:
+        """Learn the box where this player's hands move (3 s, once, at start).
+
+        Without it, a seated player whose hands sit low in the frame can only
+        reach the bottom of the screen and cannot understand why -- the classic
+        "I don't know where my hand is pointing" complaint.
+        """
+        if self._trail_demo or self._calib_box is not None or not self._world_ready():
+            return
+        if self._calib_start_t is None:
+            self._calib_start_t = now
+        for b in self._vis[0]:
+            self._calib_pts.append((b.x, b.y))
+        if now - self._calib_start_t >= CALIB_SECONDS:
+            self._finish_calibration(now)
+
+    def _finish_calibration(self, now: float) -> None:
+        xs = [p[0] for p in self._calib_pts]
+        ys = [p[1] for p in self._calib_pts]
+        if xs and (max(xs) - min(xs)) >= CALIB_MIN_SPAN and (max(ys) - min(ys)) >= CALIB_MIN_SPAN:
+            x0 = max(0.0, min(xs) - CALIB_PAD)
+            x1 = min(1.0, max(xs) + CALIB_PAD)
+            y0 = max(0.0, min(ys) - CALIB_PAD)
+            y1 = min(1.0, max(ys) + CALIB_PAD)
+            x0, x1 = _widen(x0, x1, CALIB_MIN_BOX)
+            y0, y1 = _widen(y0, y1, CALIB_MIN_BOX)
+            self._calib_box = (x0, x1, y0, y1)
+            print(
+                f"[calib] hands move in x {x0:.2f}..{x1:.2f}, y {y0:.2f}..{y1:.2f}"
+                f" ({len(xs)} samples)",
+                file=sys.stderr,
+            )
+        else:
+            self._calib_box = CALIB_DEFAULT
+            print(
+                f"[calib] too little movement ({len(xs)} samples) -- default box",
+                file=sys.stderr,
+            )
+        self._calib_done_t = now
+
+    def _map_blade(self, b) -> tuple[float, float]:
+        """Camera coordinates (0..1) -> screen coordinates (0..1)."""
+        x0, x1, y0, y1 = self._calib_box or CALIB_DEFAULT
+        nx = (b.x - x0) / max(1e-6, x1 - x0)
+        ny = (b.y - y0) / max(1e-6, y1 - y0)
+        return min(1.0, max(0.0, nx)), min(1.0, max(0.0, ny))
+
     def _feed_trails(self, dt: float) -> None:
         """Push the newest blade samples into the trails.
 
@@ -218,7 +305,8 @@ class GameWindow(QWidget):
             return  # same vision sample: nothing new to push
         self._last_pub_t = pub_t
         for k, b in enumerate(blades[:2]):
-            self._trails[k].push(b.x * GAME_W, b.y * GAME_H, pub_t)
+            sx, sy = self._map_blade(b)
+            self._trails[k].push(sx * GAME_W, sy * GAME_H, pub_t)
 
     # ---- painting ----
 
@@ -273,8 +361,9 @@ class GameWindow(QWidget):
         if st.game_over:
             self._draw_game_over(p)
 
-        # idle placeholder only while nothing is tracked at all
-        if not blades and n_trail_pts == 0:
+        # idle placeholder only while nothing is tracked at all (never during
+        # the camera warm-up: it collided with the hint text)
+        if not blades and n_trail_pts == 0 and self._world_ready():
             r = 60 + 18 * math.sin(self._pulse_t * 2 * math.pi * 0.5)
             cx, cy = GAME_W / 2, GAME_H / 2
             pen = QPen(QColor(255, 170, 60))
@@ -294,29 +383,117 @@ class GameWindow(QWidget):
             }.get(status, f"视觉未就绪（{status}）")
             p.setFont(QFont("Microsoft YaHei", 22, QFont.Weight.Bold))
             p.setPen(QColor(255, 210, 120))
+            waited = max(0.0, now - (self._not_ready_since or now))
             p.drawText(
-                QRect(0, int(GAME_H * 0.42), GAME_W, 60),
+                QRect(0, int(GAME_H * 0.40), GAME_W, 60),
                 Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
-                ready_text + "  请把手举到镜头前",
+                ready_text,
+            )
+            p.setFont(QFont("Microsoft YaHei", 14))
+            p.setPen(QColor(200, 170, 120))
+            p.drawText(
+                QRect(0, int(GAME_H * 0.40) + 44, GAME_W, 30),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                f"已等待 {waited:.0f} 秒（摄像头首次打开较慢，最多约 10 秒）· 就绪后请把手举到镜头前",
+            )
+        elif not self._trail_demo and not blades and now - self._last_blade_t > 1.2:
+            # camera is running but nothing is tracked: almost always "hand not
+            # in frame / too close to the lens / in the dark"
+            p.setFont(QFont("Microsoft YaHei", 20, QFont.Weight.Bold))
+            p.setPen(QColor(255, 180, 90))
+            p.drawText(
+                QRect(0, int(GAME_H * 0.30), GAME_W, 40),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                "没检测到手 —— 把手举到镜头前，正对摄像头（右下角是摄像头画面）",
             )
 
-        for b in blades:
-            x, y = b.x * GAME_W, b.y * GAME_H
-            pen = QPen(QColor(255, 200, 80))
-            pen.setWidth(2)
-            p.setPen(pen)
-            p.setBrush(QColor(255, 200, 80, 60))
-            p.drawEllipse(int(x - 12), int(y - 12), 24, 24)
-            p.setBrush(Qt.NoBrush)
-            p.drawLine(int(x - 20), int(y), int(x + 20), int(y))
-            p.drawLine(int(x), int(y - 20), int(x), int(y + 20))
+        # the scripted selftest must never be mistaken for real input
+        if self._trail_demo:
+            p.setFont(QFont("Microsoft YaHei", 16, QFont.Weight.Bold))
+            p.setPen(QColor(255, 120, 120))
+            p.drawText(
+                QRect(16, int(GAME_H) - 46, GAME_W - 32, 30),
+                Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                "自动演示模式：刀刃由脚本驱动，与你的手无关（不加 --selftest 就是真机模式）",
+            )
 
-        if preview is not None:
+        # where the blade currently is: the published hand points in live mode,
+        # the extrapolated trail tip in demo mode (synthetic vision has no hands)
+        if blades:
+            cursors = [tuple(v * s for v, s in zip(self._map_blade(b), (GAME_W, GAME_H))) for b in blades]
+        elif self._trail_demo:
+            cursors = [t.tip(now) for t in self._trails if t.stats()["points"] > 0]
+        else:
+            cursors = []
+
+        for idx, (x, y) in enumerate(cursors):
+            # big pulsing reticle: at 60fps a 24px circle reads as "a dot you
+            # cannot find" -- the player must see where their hand maps to
+            pulse = 0.5 + 0.5 * math.sin(self._pulse_t * 2 * math.pi * 0.8)
+            outer = 30 + 4 * pulse
+            pen = QPen(QColor(255, 220, 120, 190), 3)
+            p.setPen(pen)
+            p.setBrush(QColor(255, 200, 80, 40))
+            p.drawEllipse(int(x - outer), int(y - outer), int(2 * outer), int(2 * outer))
+            p.setBrush(QColor(255, 235, 180, 150))
+            p.drawEllipse(int(x - 6), int(y - 6), 12, 12)  # exact mapped point
+            p.setPen(QPen(QColor(255, 200, 80, 150), 2))
+            p.drawLine(int(x - outer - 12), int(y), int(x - outer), int(y))
+            p.drawLine(int(x + outer), int(y), int(x + outer + 12), int(y))
+            p.drawLine(int(x), int(y - outer - 12), int(x), int(y - outer))
+            p.drawLine(int(x), int(y + outer), int(x), int(y + outer + 12))
+            p.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
+            p.setPen(QColor(255, 220, 140, 200))
+            p.drawText(int(x + outer + 6), int(y - outer), f"手{idx + 1}")
+
+        # the preview is a real-camera aid; in demo mode there is none to show
+        if preview is not None and not self._trail_demo:
             img = QImage(preview, PREVIEW_W, PREVIEW_H, 3 * PREVIEW_W, QImage.Format.Format_BGR888)
-            px_, py_ = GAME_W - PREVIEW_W - 16, GAME_H - PREVIEW_H - 16
-            p.drawImage(px_, py_, img)
+            # 1.5x the stored 240x135 buffer: big enough to recognise your own
+            # hand position, still cheap to upload every frame
+            pw, ph = int(PREVIEW_W * 1.5), int(PREVIEW_H * 1.5)
+            px_, py_ = GAME_W - pw - 16, GAME_H - ph - 32
+            p.drawImage(QRect(px_, py_, pw, ph), img)
             p.setPen(QPen(QColor(90, 90, 90)))
-            p.drawRect(px_, py_, PREVIEW_W, PREVIEW_H)
+            p.drawRect(px_, py_, pw, ph)
+            # the calibrated region, so the player sees what the game reads
+            if self._calib_box is not None:
+                x0, x1, y0, y1 = self._calib_box
+                rx, ry = px_ + x0 * pw, py_ + y0 * ph
+                rw, rh = (x1 - x0) * pw, (y1 - y0) * ph
+                p.setPen(QPen(QColor(120, 220, 140, 160), 1, Qt.PenStyle.DashLine))
+                p.drawRect(int(rx), int(ry), int(rw), int(rh))
+            # overlay the tracked hand points (camera coordinates) so "where
+            # does my hand go?" is answerable at a glance instead of by trial
+            for b in blades:
+                mx, my = px_ + b.x * pw, py_ + b.y * ph
+                p.setPen(QPen(QColor(255, 220, 120), 2))
+                p.setBrush(QColor(255, 220, 120, 180))
+                p.drawEllipse(int(mx - 5), int(my - 5), 10, 10)
+            p.setBrush(Qt.NoBrush)
+            p.setFont(QFont("Microsoft YaHei", 9))
+            p.setPen(QColor(180, 180, 180))
+            p.drawText(int(px_), int(py_) - 6, "摄像头预览 · 黄点=已识别的手（绿框=校准后的有效区）")
+
+        if not self._trail_demo:
+            # calibration narration
+            if self._calib_box is None and self._calib_start_t is not None:
+                left = max(0.0, CALIB_SECONDS - (now - self._calib_start_t))
+                p.setFont(QFont("Microsoft YaHei", 16, QFont.Weight.Bold))
+                p.setPen(QColor(120, 220, 140))
+                p.drawText(
+                    QRect(0, int(GAME_H * 0.30), GAME_W, 30),
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                    f"校准中 {left:.1f}s —— 请举双手在镜头前左右挥动（决定你的手势映射范围）",
+                )
+            elif self._calib_done_t is not None and now - self._calib_done_t < CALIB_BANNER_S:
+                p.setFont(QFont("Microsoft YaHei", 16, QFont.Weight.Bold))
+                p.setPen(QColor(120, 220, 140))
+                p.drawText(
+                    QRect(0, int(GAME_H * 0.30), GAME_W, 30),
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                    "校准完成 —— 现在挥手就是刀刃",
+                )
 
         self._draw_hud(p, status, infer_ms, vis_hz, len(blades))
 

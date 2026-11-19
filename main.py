@@ -108,6 +108,10 @@ def main() -> int:
     )
     if selftest:
         win.audio.muted = True
+    if selftest and not live_camera:
+        print("[AirFruit] 模式：自动演示（刀刃由脚本驱动，与你的手无关）")
+    else:
+        print(f"[AirFruit] 模式：真机 — 摄像头 {_camera_index(args)}，挥手切水果")
     win.show()
     win.start()
 
