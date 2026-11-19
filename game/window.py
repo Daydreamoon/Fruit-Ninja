@@ -30,6 +30,7 @@ from vision.thread import VisionThread
 
 GAME_W, GAME_H = 1280, 720
 DEMO_PUSH_PERIOD = 1.0 / 30.0  # trail demo feeds the trail at vision rate
+DEMO_BLADE_SPEED = 4200.0  # px/s — fast enough to reach a falling fruit
 
 
 class GameWindow(QWidget):
@@ -69,6 +70,8 @@ class GameWindow(QWidget):
         self._trail_demo = use_synthetic
         self._demo_t = 0.0
         self._demo_acc = 0.0
+        # scripted hands chase fruit, so the synthetic selftest slices reliably
+        self._demo_pos = [(GAME_W * 0.5, GAME_H * 0.62), (GAME_W * 0.5, GAME_H * 0.38)]
 
         # --- game state (M4) ---
         self.state = GameState()
@@ -165,6 +168,34 @@ class GameWindow(QWidget):
             return True
         return self._vis[2] == "ok"
 
+    def _push_demo_blades(self, now: float) -> None:
+        """Scripted hands for --selftest: chase fruit, sweep when there is none.
+
+        The synthetic camera sees no person, so the selftest drives the trails
+        itself. Aiming at the lowest *fruit* (never a bomb, value==0) makes the
+        slice assertion deterministic instead of depending on where a fixed
+        sweep happens to cross a randomly spawned fruit. Speed is bounded so the
+        trail still reads as a hand and the collision segments look real.
+        """
+        targets = sorted(
+            (f for f in self.state.fruits if f.value > 0), key=lambda f: f.y, reverse=True
+        )
+        for k in range(2):
+            x, y = self._demo_pos[k]
+            if k < len(targets):
+                tx, ty = targets[k].x, targets[k].y
+            else:  # idle sweep while waiting for the next wave
+                tx = GAME_W * (0.5 + 0.35 * math.sin(self._demo_t * 1.7 + k * 2.1))
+                ty = GAME_H * (0.5 + 0.28 * math.sin(self._demo_t * 2.3 + k * 1.3))
+            dx, dy = tx - x, ty - y
+            dist = math.hypot(dx, dy)
+            if dist > 1e-6:
+                step = min(dist, DEMO_BLADE_SPEED * DEMO_PUSH_PERIOD)
+                x += dx / dist * step
+                y += dy / dist * step
+            self._demo_pos[k] = (x, y)
+            self._trails[k].push(x, y, now)
+
     def _feed_trails(self, dt: float) -> None:
         """Push the newest blade samples into the trails.
 
@@ -180,16 +211,7 @@ class GameWindow(QWidget):
             self._demo_acc += dt
             if self._demo_acc >= DEMO_PUSH_PERIOD:
                 self._demo_acc = 0.0
-                # hand 0: wide sweep; hand 1: tight orbit through the fruit
-                # corridor (x 0.32..0.68W, apex band) so the demo actually slices
-                for k in range(2):
-                    if k == 0:
-                        x = GAME_W * (0.5 + 0.35 * math.sin(self._demo_t * 1.7))
-                        y = GAME_H * (0.5 + 0.28 * math.sin(self._demo_t * 2.3))
-                    else:
-                        x = GAME_W * (0.5 + 0.20 * math.sin(self._demo_t * 3.1 + 1.0))
-                        y = GAME_H * (0.42 + 0.16 * math.sin(self._demo_t * 4.3 + 1.7))
-                    self._trails[k].push(x, y, now)
+                self._push_demo_blades(now)
             return
         blades, _preview, _status, _infer, _hz, _total, pub_t = self._vis
         if pub_t == self._last_pub_t:
