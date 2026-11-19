@@ -11,10 +11,16 @@ import math
 import os
 import tempfile
 import wave
+from pathlib import Path
 
 import numpy as np
 
 SAMPLE_RATE = 44100
+# Written next to the package, not into a temp dir: on this machine TMP was not
+# set for child processes, so mkdtemp() landed the WAVs in the working
+# directory (and git happily committed 50 of them). A fixed project-local
+# cache also lets repeated launches skip re-synthesis.
+CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache" / "sfx"
 
 
 def _write_wav(path: str, samples: np.ndarray) -> None:
@@ -121,13 +127,13 @@ class AudioBank:
             self.enabled = False
             return
         try:
-            d = tempfile.mkdtemp(prefix="airfruit_sfx_")
-            self._dir = d
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
             for name, builder in _BUILDERS.items():
-                path = os.path.join(d, f"{name}.wav")
-                _write_wav(path, builder(name))
+                path = CACHE_DIR / f"{name}.wav"
+                if not path.exists():
+                    _write_wav(str(path), builder(name))
                 eff = QSoundEffect()
-                eff.setSource(QUrl.fromLocalFile(path))
+                eff.setSource(QUrl.fromLocalFile(str(path)))
                 eff.setVolume(0.55)
                 self._sounds[name] = eff
             self.status = f"ready ({len(self._sounds)} sounds)"

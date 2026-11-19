@@ -7,3 +7,6 @@ models/
 
 # M5 recordings are generated locally: python main.py --selftest 25 --visible --record demo/demo.mp4
 demo/
+
+# synthesized sound cache (regenerated on demand)
+.cache/
