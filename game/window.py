@@ -21,6 +21,7 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from game.state import GameState
 from game.trail import BladeTrail
 from vision.shared import PREVIEW_W, PREVIEW_H, SharedVisionState
 from vision.thread import VisionThread
@@ -61,6 +62,9 @@ class GameWindow(QWidget):
         self._demo_t = 0.0
         self._demo_acc = 0.0
 
+        # --- game state (M4) ---
+        self.state = GameState()
+
         self._timer = QTimer(self)
         self._timer.setInterval(16)  # ~60 Hz request
         self._timer.timeout.connect(self._tick)
@@ -94,6 +98,16 @@ class GameWindow(QWidget):
         self._pulse_t += dt
         self._vis = self.vision_shared.snapshot()
         self._feed_trails(dt)
+
+        # --- M4 game step: physics/waves, then blade-vs-fruit collisions ---
+        self.state.update(dt)
+        if not self.state.game_over:
+            now = time.perf_counter()
+            segs: list[tuple[float, float, float, float]] = []
+            for tr in self._trails:
+                segs.extend(tr.collision_segments(now))
+            if segs:
+                self.state.collide_blade(segs)
         self.update()
 
     def _feed_trails(self, dt: float) -> None:
@@ -111,9 +125,15 @@ class GameWindow(QWidget):
             self._demo_acc += dt
             if self._demo_acc >= DEMO_PUSH_PERIOD:
                 self._demo_acc = 0.0
+                # hand 0: wide sweep; hand 1: tight orbit through the fruit
+                # corridor (x 0.32..0.68W, apex band) so the demo actually slices
                 for k in range(2):
-                    x = GAME_W * (0.5 + 0.35 * math.sin(self._demo_t * 1.7 + k * math.pi))
-                    y = GAME_H * (0.5 + 0.28 * math.sin(self._demo_t * 2.3 + k * 1.2))
+                    if k == 0:
+                        x = GAME_W * (0.5 + 0.35 * math.sin(self._demo_t * 1.7))
+                        y = GAME_H * (0.5 + 0.28 * math.sin(self._demo_t * 2.3))
+                    else:
+                        x = GAME_W * (0.5 + 0.20 * math.sin(self._demo_t * 3.1 + 1.0))
+                        y = GAME_H * (0.42 + 0.16 * math.sin(self._demo_t * 4.3 + 1.7))
                     self._trails[k].push(x, y, now)
             return
         blades, _preview, _status, _infer, _hz, _total, pub_t = self._vis
@@ -155,6 +175,26 @@ class GameWindow(QWidget):
             trail.draw(p, now)
         n_trail_pts = sum(t.stats()["points"] for t in self._trails)
 
+        # --- M4 game objects ---
+        st = self.state
+        for f in st.fruits:
+            self._draw_fruit(p, f)
+        for h in st.halves:
+            self._draw_half(p, h)
+        for q in st.particles:
+            alpha = max(0.0, min(1.0, q.life / 0.45))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor(q.color[0], q.color[1], q.color[2], int(200 * alpha)))
+            p.drawEllipse(int(q.x - 4), int(q.y - 4), 8, 8)
+        p.setFont(QFont("Microsoft YaHei", 14, QFont.Weight.Bold))
+        for t in st.texts:
+            alpha = max(0.0, min(1.0, t.life / 0.9))
+            p.setPen(QColor(t.color[0], t.color[1], t.color[2], int(230 * alpha)))
+            p.drawText(int(t.x), int(t.y), t.text)
+        p.setBrush(Qt.NoBrush)
+        if st.game_over:
+            self._draw_game_over(p)
+
         # idle placeholder only while nothing is tracked at all
         if not blades and n_trail_pts == 0:
             r = 60 + 18 * math.sin(self._pulse_t * 2 * math.pi * 0.5)
@@ -186,6 +226,41 @@ class GameWindow(QWidget):
 
         self._draw_hud(p, status, infer_ms, vis_hz, len(blades))
 
+    def _draw_fruit(self, p: QPainter, f) -> None:
+        x, y, r = int(f.x), int(f.y), int(f.radius)
+        if f.bomb:
+            blink = 0.5 + 0.5 * math.sin(self._pulse_t * 8)
+            p.setPen(QPen(QColor(220, 60, 40, int(120 + 120 * blink)), 3))
+            p.setBrush(QColor(45, 45, 52))
+            p.drawEllipse(x - r, y - r, 2 * r, 2 * r)
+            p.setPen(QColor(255, 140, 80))
+            p.drawLine(x, y - r - 10, x, y - r + 6)  # fuse stub
+            return
+        grad = QRadialGradient(f.x - f.radius * 0.35, f.y - f.radius * 0.35, f.radius * 1.35)
+        grad.setColorAt(0.0, QColor(*f.core))
+        grad.setColorAt(1.0, QColor(f.rim[0], f.rim[1], f.rim[2], 170))
+        p.setPen(Qt.NoPen)
+        p.setBrush(grad)
+        p.drawEllipse(x - r, y - r, 2 * r, 2 * r)
+
+    def _draw_half(self, p: QPainter, h) -> None:
+        alpha = max(0.0, min(1.0, h.life / h.max_life))
+        p.save()
+        p.translate(h.x, h.y)
+        p.rotate(math.degrees(h.angle))
+        p.setPen(Qt.NoPen)
+        c = h.color
+        p.setBrush(QColor(c[0], c[1], c[2], int(220 * alpha)))
+        r = int(h.radius)
+        p.drawPie(-r, -r, 2 * r, 2 * r, 0, 180 * 16)
+        p.restore()
+
+    def _draw_game_over(self, p: QPainter) -> None:
+        p.fillRect(0, 0, GAME_W, GAME_H, QColor(0, 0, 0, 140))
+        p.setPen(QColor(255, 90, 70))
+        p.setFont(QFont("Microsoft YaHei", 42, QFont.Weight.Bold))
+        p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, f"GAME OVER · {self.state.score} 分")
+
     def _draw_hud(self, p: QPainter, status: str, infer_ms: float, vis_hz: int, n_blades: int) -> None:
         fps = self.paint_fps()
         ms = self.frame_ms()
@@ -197,6 +272,8 @@ class GameWindow(QWidget):
         if status == "camera_open_failed" or status.startswith("camera_"):
             p.setPen(QColor(255, 120, 90))
         p.drawText(16, 70, f"vision: {status}   {vis_hz} Hz   infer {infer_ms:4.1f} ms   blades {n_blades}")
+        p.setPen(QColor(255, 230, 140))
+        p.drawText(16, 92, self.state.hud())
 
     # ---- stats (sliding 1-second windows) ----
 
@@ -229,4 +306,5 @@ class GameWindow(QWidget):
             "avg_tick_fps": self.tick_count / elapsed,
             "avg_paint_fps": self.paint_count / elapsed,
             "trail_points": max((t.stats()["points"] for t in self._trails), default=0),
+            "game": self.state.stats.as_dict(),
         }

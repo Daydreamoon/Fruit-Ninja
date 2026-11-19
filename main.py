@@ -63,9 +63,25 @@ def main() -> int:
             print(f"SELFTEST seconds={s['seconds']:.1f} ticks={s['ticks']} paints={s['paints']}")
             print(f"SELFTEST avg tick fps={s['avg_tick_fps']:.1f} avg paint fps={s['avg_paint_fps']:.1f}")
             print(f"SELFTEST vision status={status} hz={vis_hz} samples={samples} infer_ms={infer_ms:.1f}")
+            g = s["game"]
             print(f"SELFTEST trail_points={s['trail_points']}")
-            ok = s["avg_paint_fps"] >= 55.0 and vis_hz >= 20 and s["trail_points"] >= 3
-            print(f"SELFTEST {'PASS' if ok else 'FAIL'} (require render>=55fps, vision>=20Hz, trail>=3pts)")
+            print(
+                f"SELFTEST game spawned={g['spawned']} sliced={g['sliced']}"
+                f" missed={g['missed']} bombs={g['bombs_sliced']} round={g['rounds_played']}"
+                f" score={win.state.score}"
+            )
+            ok = (
+                s["avg_paint_fps"] >= 55.0
+                and vis_hz >= 20
+                and s["trail_points"] >= 3
+                and g["spawned"] >= 6
+                and g["sliced"] >= 1
+            )
+            print(
+                "SELFTEST "
+                + ("PASS" if ok else "FAIL")
+                + " (render>=55fps, vision>=20Hz, trail>=3pts, spawn>=6, slice>=1)"
+            )
             exit_code[0] = 0 if ok else 1
             app.quit()
 

@@ -94,5 +94,25 @@ class BladeTrail:
         while self._pts and now - self._pts[0][2] > self._lifetime:
             self._pts.pop(0)
 
+    def collision_segments(
+        self, now: float, window: float = 0.1
+    ) -> list[tuple[float, float, float, float]]:
+        """Recent blade pieces (x0, y0, x1, y1) for slicing tests.
+
+        Uses only the last `window` seconds of samples plus the extrapolated
+        tip segment, so a fast swipe stays 'live' for slicing briefly after
+        the hand moved on.
+        """
+        pts = [p for p in self._pts if now - p[2] <= window]
+        segs: list[tuple[float, float, float, float]] = []
+        for a, b in zip(pts, pts[1:]):
+            segs.append((a[0], a[1], b[0], b[1]))
+        tip = self.tip(now)
+        if pts and tip is not None:
+            lx, ly, _lt = self._last
+            tx, ty = tip
+            segs.append((lx, ly, tx, ty))
+        return segs
+
     def stats(self) -> dict:
         return {"points": len(self._pts), "active": self._last is not None}
