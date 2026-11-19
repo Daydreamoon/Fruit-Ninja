@@ -26,6 +26,23 @@ BOMB_TABLE = ("bomb", 36, 0, 875, (45, 45, 52), (220, 60, 40))
 BOMB_FROM_ROUND = 3
 BOMB_CHANCE = 1 / 8  # per spawned object once bombs are allowed
 
+# --- M4 difficulty ramp (M5 tuning) -------------------------------------
+# Each round is a little faster and, once bombs are legal, a little meaner.
+# Kept mild: at round 8 launches are +42% and bombs +5 points of probability.
+ROUND_SPEED_STEP = 0.06
+ROUND_SPEED_CAP = 1.6
+ROUND_BOMB_STEP = 0.01
+ROUND_BOMB_CAP = 0.22
+
+
+def _round_scale(round_no: int) -> float:
+    return min(ROUND_SPEED_CAP, 1.0 + ROUND_SPEED_STEP * max(0, round_no - 1))
+
+
+def _bomb_chance(round_no: int) -> float:
+    extra = ROUND_BOMB_STEP * max(0, round_no - BOMB_FROM_ROUND)
+    return min(ROUND_BOMB_CAP, BOMB_CHANCE + extra)
+
 
 class Fruit:
     """A whole fruit (or bomb) flying ballistically until sliced or missed."""
@@ -138,7 +155,7 @@ def spawn_object(round_no: int):
     Launch point sits below the bottom edge; angle is mostly up with spread.
     Returns the Fruit (caller sets exact launch timing).
     """
-    if round_no >= BOMB_FROM_ROUND and random.random() < BOMB_CHANCE:
+    if round_no >= BOMB_FROM_ROUND and random.random() < _bomb_chance(round_no):
         name, radius, value, speed, core, rim = BOMB_TABLE
         bomb = True
     else:
@@ -148,7 +165,7 @@ def spawn_object(round_no: int):
     y = GAME_H + radius + 6
     # aim up with lateral spread; faster objects fly straighter (less spread)
     angle = math.radians(random.uniform(78, 102))
-    speed = speed * random.uniform(1.0, 1.5)  # reference: initial * (1 + rand/2)
+    speed = speed * random.uniform(1.0, 1.5) * _round_scale(round_no)
     vx = speed * math.cos(angle) * random.choice((-1, 1))
     vy = -speed * math.sin(angle)
     return Fruit(name, x, y, vx, vy, radius, value, core, rim, bomb)

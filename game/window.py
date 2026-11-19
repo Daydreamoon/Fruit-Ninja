@@ -21,6 +21,8 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from game.audio import AudioBank
+from game.recorder import Recorder
 from game.state import GameState
 from game.trail import BladeTrail
 from vision.shared import PREVIEW_W, PREVIEW_H, SharedVisionState
@@ -31,7 +33,13 @@ DEMO_PUSH_PERIOD = 1.0 / 30.0  # trail demo feeds the trail at vision rate
 
 
 class GameWindow(QWidget):
-    def __init__(self, use_synthetic: bool = False, camera_index: int = 0) -> None:
+    def __init__(
+        self,
+        use_synthetic: bool = False,
+        camera_index: int = 0,
+        audio: bool = True,
+        record_path: str | None = None,
+    ) -> None:
         super().__init__()
         self.setWindowTitle("AirFruit · 隔空切水果")
         self.setFixedSize(GAME_W, GAME_H)
@@ -65,6 +73,11 @@ class GameWindow(QWidget):
         # --- game state (M4) ---
         self.state = GameState()
 
+        # --- polish layer (M5): procedural sound + optional MP4 capture ---
+        self.audio = AudioBank(enabled=audio)
+        self.recorder = Recorder(record_path) if record_path else None
+        self._grabbing = False
+
         self._timer = QTimer(self)
         self._timer.setInterval(16)  # ~60 Hz request
         self._timer.timeout.connect(self._tick)
@@ -75,6 +88,8 @@ class GameWindow(QWidget):
         self._timer.start()
         self._vision.start()
         self._vision_started = True
+        if self.recorder is not None:
+            self.recorder.start((GAME_W, GAME_H))
 
     def shutdown(self) -> None:
         """Idempotent stop of both loops; safe from closeEvent and selftest."""
@@ -83,6 +98,8 @@ class GameWindow(QWidget):
         if self._vision_started:
             self._vision.stop()
             self._vision_started = False
+        if self.recorder is not None:
+            self.recorder.stop()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.shutdown()
@@ -108,7 +125,31 @@ class GameWindow(QWidget):
                 segs.extend(tr.collision_segments(now))
             if segs:
                 self.state.collide_blade(segs)
+        self._flush_audio_events()
         self.update()
+        if self.recorder is not None and self.recorder.status == "recording":
+            # grab() paints synchronously into a pixmap; flag the extra pass so
+            # the fps counters keep measuring real presentation frames only.
+            self._grabbing = True
+            try:
+                self.recorder.capture(self.grab().toImage())
+            finally:
+                self._grabbing = False
+
+    def _flush_audio_events(self) -> None:
+        """Turn game events raised this tick into sound (M5)."""
+        events = self.state.events
+        if not events:
+            return
+        del events[:]  # drain regardless of whether audio is enabled
+        if not self.audio.enabled:
+            return
+        for name in events:
+            if name == "boom":
+                self.audio.play("boom")
+                QTimer.singleShot(450, lambda: self.audio.play("gameover"))
+            else:
+                self.audio.play(name)
 
     def _feed_trails(self, dt: float) -> None:
         """Push the newest blade samples into the trails.
@@ -162,8 +203,9 @@ class GameWindow(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: N802
         now = time.perf_counter()
-        self._paint_times.append(now)
-        self.paint_count += 1
+        if not self._grabbing:  # recorder's grab() pass is not a shown frame
+            self._paint_times.append(now)
+            self.paint_count += 1
 
         p = QPainter(self)
         p.drawPixmap(0, 0, self._bg)
@@ -268,7 +310,7 @@ class GameWindow(QWidget):
         p.setFont(QFont("Microsoft YaHei", 13))
         p.drawText(16, 26, f"FPS {fps:5.1f}   frame {ms:4.1f} ms   ticks {self.tick_count}")
         p.setPen(QColor(150, 150, 150))
-        p.drawText(16, 48, "M3 刀光轨迹 · 玩法 M4")
+        p.drawText(16, 48, f"M4 玩法闭环 · M5 打磨 · sfx {self.audio.status}")
         if status == "camera_open_failed" or status.startswith("camera_"):
             p.setPen(QColor(255, 120, 90))
         p.drawText(16, 70, f"vision: {status}   {vis_hz} Hz   infer {infer_ms:4.1f} ms   blades {n_blades}")
@@ -307,4 +349,7 @@ class GameWindow(QWidget):
             "avg_paint_fps": self.paint_count / elapsed,
             "trail_points": max((t.stats()["points"] for t in self._trails), default=0),
             "game": self.state.stats.as_dict(),
+            "audio": self.audio.status,
+            "muted": self.audio.muted,
+            "record": self.recorder.summary() if self.recorder is not None else None,
         }

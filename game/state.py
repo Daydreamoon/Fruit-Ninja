@@ -60,6 +60,7 @@ class GameState:
         self.halves: list[HalfFruit] = []
         self.particles: list[Particle] = []
         self.texts: list[FloatText] = []
+        self.events: list[str] = []  # drained by the window for sound (M5)
 
     # ---- queries for the renderer ----
 
@@ -84,6 +85,8 @@ class GameState:
                 if launch_at <= 0.0:
                     self.fruits.append(fruit)
                     self.stats.spawned += 1
+                    if not fruit.bomb:
+                        self.events.append("spawn")
             self._queue = [(at - dt, f) for at, f in self._queue if at > 0.0]
 
         # physics + miss accounting
@@ -172,6 +175,7 @@ class GameState:
                 )
             )
         self.texts.append(FloatText(f.x, f.y - f.radius, f"+{f.value}", (255, 230, 120)))
+        self.events.append("splat")
 
     def _explode_bomb(self, f: Fruit) -> None:
         f.slice()
@@ -189,6 +193,8 @@ class GameState:
                 )
             )
         self.texts.append(FloatText(f.x, f.y - f.radius, "BOOM", (255, 90, 60)))
+        self.events.append("boom")
+        self.events.append("gameover")
 
     def _decay_fx(self, dt: float) -> None:
         self.halves = [h for h in self.halves if h.update(dt)]

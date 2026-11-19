@@ -1,7 +1,7 @@
 """AirFruit entry point.
 
-Interactive:      python main.py [--camera N]
-Self-test:        python main.py --selftest [seconds] [--visible]
+Interactive:      python main.py [--camera N] [--mute] [--record out.mp4]
+Self-test:        python main.py --selftest [seconds] [--visible] [--record out.mp4]
                   offscreen render + SYNTHETIC vision input; exits 0 when
                   render fps >= 55 and vision sample rate >= 20 Hz.
 """
@@ -20,6 +20,14 @@ def _camera_index(args: list[str]) -> int:
             except ValueError:
                 pass
     return 0
+
+
+def _value(args: list[str], flag: str) -> str | None:
+    if flag in args:
+        i = args.index(flag)
+        if i + 1 < len(args):
+            return args[i + 1]
+    return None
 
 
 def main() -> int:
@@ -45,7 +53,15 @@ def main() -> int:
 
     app = QApplication(sys.argv)
     # selftest uses synthetic vision input: no camera needed (regression mode)
-    win = GameWindow(use_synthetic=selftest, camera_index=_camera_index(args))
+    # audio stays enabled (so the sfx backend is exercised) but muted: CI-quiet.
+    win = GameWindow(
+        use_synthetic=selftest,
+        camera_index=_camera_index(args),
+        audio="--mute" not in args,
+        record_path=_value(args, "--record"),
+    )
+    if selftest:
+        win.audio.muted = True
     win.show()
     win.start()
 
@@ -65,22 +81,29 @@ def main() -> int:
             print(f"SELFTEST vision status={status} hz={vis_hz} samples={samples} infer_ms={infer_ms:.1f}")
             g = s["game"]
             print(f"SELFTEST trail_points={s['trail_points']}")
+            print(f"SELFTEST audio={s['audio']} muted={s['muted']}")
+            if s["record"]:
+                r = s["record"]
+                print(f"SELFTEST record status={r['status']} frames={r['frames']} path={r['path']}")
             print(
                 f"SELFTEST game spawned={g['spawned']} sliced={g['sliced']}"
                 f" missed={g['missed']} bombs={g['bombs_sliced']} round={g['rounds_played']}"
                 f" score={win.state.score}"
             )
+            # spawn expectation scales with the run length: a 20 s run must see
+            # a full wave or two, a 6 s smoke test only needs to prove the loop.
+            spawn_needed = max(2, min(6, round(seconds / 4)))
             ok = (
                 s["avg_paint_fps"] >= 55.0
                 and vis_hz >= 20
                 and s["trail_points"] >= 3
-                and g["spawned"] >= 6
+                and g["spawned"] >= spawn_needed
                 and g["sliced"] >= 1
             )
             print(
                 "SELFTEST "
                 + ("PASS" if ok else "FAIL")
-                + " (render>=55fps, vision>=20Hz, trail>=3pts, spawn>=6, slice>=1)"
+                + f" (render>=55fps, vision>=20Hz, trail>=3pts, spawn>={spawn_needed}, slice>=1)"
             )
             exit_code[0] = 0 if ok else 1
             app.quit()
@@ -92,6 +115,8 @@ def main() -> int:
     # closeEvent (Qt6 quit() closes windows) usually already ran shutdown();
     # this is the belt-and-braces path for the interactive mode.
     win.shutdown()
+    if selftest and win.recorder is not None:
+        print(f"SELFTEST recorder {win.recorder.summary()}")
     return exit_code[0] if selftest else 0
 
 

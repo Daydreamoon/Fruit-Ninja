@@ -4,3 +4,6 @@ __pycache__/
 models/
 *.log
 .DS_Store
+
+# M5 recordings are generated locally: python main.py --selftest 25 --visible --record demo/demo.mp4
+demo/

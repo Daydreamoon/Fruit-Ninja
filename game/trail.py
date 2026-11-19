@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QPainter, QPen
 
 TRAIL_LIFETIME = 0.25  # s — matches the reference project's KNIFE_TRAIL_LIFETIME
@@ -82,12 +83,18 @@ class BladeTrail:
         for x0, y0, x1, y1, t_new in segs:
             newness = max(0.0, 1.0 - (now - t_new) / self._lifetime)
             w = 2.0 + 9.0 * newness
-            # soft glow pass, then the bright core (two short pens per segment)
-            glow = QColor(255, 200, 120, int(70 * newness))
-            p.setPen(QPen(glow, w * 3.0))
+            # Soft glow, then the bright core. Round caps/joins are what make
+            # consecutive segments read as one smooth stroke instead of a row
+            # of rectangles (M5: butt caps looked chunky at 30 Hz sampling).
+            glow = QPen(QColor(255, 190, 110, int(60 * newness)), w * 2.2)
+            glow.setCapStyle(Qt.PenCapStyle.RoundCap)
+            glow.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(glow)
             p.drawLine(int(x0), int(y0), int(x1), int(y1))
-            core = QColor(255, 250, 235, int(235 * newness))
-            p.setPen(QPen(core, w))
+            core = QPen(QColor(255, 252, 240, int(235 * newness)), w)
+            core.setCapStyle(Qt.PenCapStyle.RoundCap)
+            core.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            p.setPen(core)
             p.drawLine(int(x0), int(y0), int(x1), int(y1))
 
     def _prune(self, now: float) -> None:
