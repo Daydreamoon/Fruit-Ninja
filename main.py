@@ -33,6 +33,43 @@ def _value(args: list[str], flag: str) -> str | None:
     return None
 
 
+# interpreter check -----------------------------------------------------------
+# The app needs a Python with PySide6 + mediapipe + opencv + numpy. A stray
+# interpreter (conda base, system python) fails deep inside an import with a
+# message that says nothing about what to do -- so probe the imports up front
+# and print the fix instead of a traceback.
+REQUIRED_IMPORTS = ("PySide6.QtCore", "PySide6.QtWidgets", "cv2", "mediapipe", "numpy")
+RECOMMENDED_PYTHON = r"D:\FruitNinjaEnv\Scripts\python.exe"
+
+
+def _preflight() -> list[tuple[str, str]]:
+    """Import-probe the hard requirements; return [(module, error), ...]."""
+    broken: list[tuple[str, str]] = []
+    for mod in REQUIRED_IMPORTS:
+        try:
+            __import__(mod)
+        except Exception as exc:  # noqa: BLE001 - report, never raise
+            broken.append((mod, f"{type(exc).__name__}: {exc}"))
+    return broken
+
+
+def _explain_broken_env(broken: list[tuple[str, str]]) -> None:
+    print(f"[AirFruit] 这个 Python 解释器跑不了本项目：\n           {sys.executable}\n")
+    for mod, err in broken:
+        print(f"  - {mod:<20} {err}")
+    print("\n项目依赖装在独立环境里，请改用：")
+    print(f"  {RECOMMENDED_PYTHON} main.py")
+    print("或直接双击项目根目录的 run.bat（会自动选中正确的解释器）。\n")
+    if any(mod.startswith("PySide6") for mod, _ in broken):
+        print("QtCore 报 DLL load failed / 找不到指定的程序，常见原因：")
+        print("  Anaconda base 目录（如 D:\\Anaconda2\\）里自带旧版 msvcp140.dll (14.4x)，")
+        print("  python.exe 同目录的 DLL 优先级高于 System32，Qt 6.12 需要 14.5x，")
+        print("  于是加载 Qt6Core.dll 时报\"找不到指定的程序\"。本项目 env 没有这个问题。")
+    if any(mod == "mediapipe" for mod, _ in broken):
+        print("\nmediapipe 没有 cp313 轮子（官方只到 3.12），conda base 的 3.13 装不上，")
+        print("这也是为什么项目用 Python 3.12 的独立环境。")
+
+
 def main() -> int:
     args = sys.argv[1:]
     selftest = "--selftest" in args
@@ -48,6 +85,11 @@ def main() -> int:
         # pass --visible to run the timed selftest in a real on-screen window.
         if "--visible" not in args:
             os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+    broken = _preflight()
+    if broken:
+        _explain_broken_env(broken)
+        return 3
 
     from PySide6.QtCore import QTimer
     from PySide6.QtWidgets import QApplication

@@ -27,16 +27,20 @@
 
 > ⚠️ 本机虚拟环境放在 **`D:\FruitNinjaEnv`**（中文目录之外）。原因：位于 `D:\数字图像处理\...` 下的解释器会被本机安全软件拦掉摄像头（黑帧/拒绝访问），同一套包放到中文路径外即恢复正常，详见 docs/M0-环境探测报告.md 第 6 条。代码本身与本问题无关。
 
+**最简单：双击 `run.bat`**（自动挑对解释器，后面可以跟同样的参数，如 `run.bat --selftest 30`）。
+
+> ⚠️ **不要用 `python main.py`**。Anaconda base（`D:\Anaconda2`）里自带的旧版 `msvcp140.dll`（14.4x）就躺在 `python.exe` 旁边，Windows 优先加载它，而 Qt 6.12 需要 14.5x，于是 PySide6 报 `DLL load failed while importing QtCore: 找不到指定的程序`；何况 base 是 Python 3.13，mediapipe 根本没有 cp313 轮子。`main.py` 现在会先探测依赖，用错解释器时直接打印原因和正确命令（退出码 3），不再甩一堆 traceback。
+
 ```
 # 一次性准备（在任意位置执行）
 uv venv D:\FruitNinjaEnv --python <python3.12>
 uv pip install -r requirements.txt --python D:\FruitNinjaEnv\Scripts\python.exe   # 必须用 uv：见 M0 报告
 
-D:\FruitNinjaEnv\Scripts\python main.py                 # 真机：摄像头 + 挥手
-D:\FruitNinjaEnv\Scripts\python main.py --mute          # 静音
-D:\FruitNinjaEnv\Scripts\python main.py --selftest 20   # 离屏回归自测（合成视觉，退出码 0=PASS）
-D:\FruitNinjaEnv\Scripts\python main.py --selftest 20 --camera-live --camera 0 --visible   # 真机链路自测（需人在镜头前挥手才有刀光）
-D:\FruitNinjaEnv\Scripts\python main.py --selftest 25 --visible --record demo/airfruit-demo.mp4
+run.bat                                                 # 真机：摄像头 + 挥手
+run.bat --mute                                          # 静音
+run.bat --selftest 20                                   # 离屏回归自测（合成视觉，退出码 0=PASS）
+run.bat --selftest 20 --camera-live --camera 0 --visible   # 真机链路自测（需人在镜头前挥手才有刀光）
+run.bat --selftest 25 --visible --record demo/airfruit-demo.mp4
 D:\FruitNinjaEnv\Scripts\python vision\probes.py --camera   # 摄像头/后端体检
 ```
 
