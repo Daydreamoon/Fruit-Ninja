@@ -1,13 +1,25 @@
 """AirFruit entry point.
 
-Interactive:  python main.py
-Self-test:    python main.py --selftest [seconds]   (offscreen, prints metrics,
-              exits 0 when average paint FPS >= 55)
+Interactive:      python main.py [--camera N]
+Self-test:        python main.py --selftest [seconds] [--visible]
+                  offscreen render + SYNTHETIC vision input; exits 0 when
+                  render fps >= 55 and vision sample rate >= 20 Hz.
 """
 from __future__ import annotations
 
 import os
 import sys
+
+
+def _camera_index(args: list[str]) -> int:
+    if "--camera" in args:
+        i = args.index("--camera")
+        if i + 1 < len(args):
+            try:
+                return int(args[i + 1])
+            except ValueError:
+                pass
+    return 0
 
 
 def main() -> int:
@@ -32,23 +44,38 @@ def main() -> int:
     from game.window import GameWindow
 
     app = QApplication(sys.argv)
-    win = GameWindow()
+    # selftest uses synthetic vision input: no camera needed (regression mode)
+    win = GameWindow(use_synthetic=selftest, camera_index=_camera_index(args))
     win.show()
     win.start()
 
+    exit_code = [0]
+
     if selftest:
-        QTimer.singleShot(int(seconds * 1000), app.quit)
+        def _finish() -> None:
+            # MUST sample before app.quit(): Qt6 quit() closes all windows
+            # first, which triggers closeEvent -> shutdown() and kills the
+            # vision thread -- sampling after exec() would be a post-mortem
+            # (status "stopped", empty rate window) even when vision ran fine.
+            vis = win.vision_shared.snapshot()
+            s = win.summary()
+            blades, _preview, status, infer_ms, vis_hz, samples = vis
+            print(f"SELFTEST seconds={s['seconds']:.1f} ticks={s['ticks']} paints={s['paints']}")
+            print(f"SELFTEST avg tick fps={s['avg_tick_fps']:.1f} avg paint fps={s['avg_paint_fps']:.1f}")
+            print(f"SELFTEST vision status={status} hz={vis_hz} samples={samples} infer_ms={infer_ms:.1f}")
+            ok = s["avg_paint_fps"] >= 55.0 and vis_hz >= 20
+            print(f"SELFTEST {'PASS' if ok else 'FAIL'} (require render>=55fps, vision>=20Hz)")
+            exit_code[0] = 0 if ok else 1
+            app.quit()
+
+        QTimer.singleShot(int(seconds * 1000), _finish)
 
     app.exec()
 
-    s = win.summary()
-    print(f"SELFTEST seconds={s['seconds']:.1f} ticks={s['ticks']} paints={s['paints']}")
-    print(f"SELFTEST avg tick fps={s['avg_tick_fps']:.1f} avg paint fps={s['avg_paint_fps']:.1f}")
-    if selftest:
-        ok = s["avg_paint_fps"] >= 55.0
-        print(f"SELFTEST {'PASS' if ok else 'FAIL'} (require >=55fps)")
-        return 0 if ok else 1
-    return 0
+    # closeEvent (Qt6 quit() closes windows) usually already ran shutdown();
+    # this is the belt-and-braces path for the interactive mode.
+    win.shutdown()
+    return exit_code[0] if selftest else 0
 
 
 if __name__ == "__main__":

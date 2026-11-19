@@ -18,7 +18,7 @@
 
 - [x] M0 环境探测（依赖 / 模型 / CPU 基准 116Hz ✅；摄像头绑定异常待硬件侧恢复，详见 docs/M0-环境探测报告.md）
 - [x] M1 渲染骨架（自测：离屏 62fps / 真屏 60.4fps 锁垂直同步 ✅）
-- [ ] M2 视觉线程接入（手点 + 迷你预览）
+- [x] M2 视觉线程接入（合成自测：视觉 30Hz + 渲染 62.5fps 共存 ✅；摄像头恢复后跑 `--camera` 真机复测，详见 docs/M2-视觉接入测试.md）
 - [ ] M3 刀光轨迹（渐隐 + 插值）
 - [ ] M4 玩法闭环（水果 / 计分 / 炸弹 / 状态机）
 - [ ] M5 打磨（参数 / 音效 / 演示）
@@ -27,7 +27,7 @@
 
 ```
 python -m venv .venv          # 需要 Python 3.12
-.venv\Scripts\pip install -r requirements.txt
+uv pip install -r requirements.txt --python .venv\Scripts\python.exe   # 用 uv：见 M0 报告
 .venv\Scripts\python main.py
 ```
 

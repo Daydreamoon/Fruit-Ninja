@@ -1,10 +1,7 @@
-"""AirFruit game window: QTimer-driven 60fps rendering skeleton (M1).
+"""AirFruit game window: QTimer-driven 60fps rendering (M1) + vision preview (M2).
 
-Design (from the project plan):
-- One QTimer at 16 ms drives the whole game; every tick integrates dt-based
-  physics then calls update(); paintEvent draws from cached surfaces.
-- Background is rendered ONCE into a QPixmap; per-frame painting is cheap.
-- HUD shows live paint FPS / frame ms so the 60fps hard target is visible.
+Render thread owns nothing vision-related: every tick it snapshots the
+SharedVisionState written by the vision thread and draws from it.
 """
 from __future__ import annotations
 
@@ -15,6 +12,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QImage,
     QLinearGradient,
     QPainter,
     QPen,
@@ -23,13 +21,14 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from vision.shared import PREVIEW_W, PREVIEW_H, SharedVisionState
+from vision.thread import VisionThread
+
 GAME_W, GAME_H = 1280, 720
 
 
 class GameWindow(QWidget):
-    """Owns the tick timer; state grows milestone by milestone."""
-
-    def __init__(self) -> None:
+    def __init__(self, use_synthetic: bool = False, camera_index: int = 0) -> None:
         super().__init__()
         self.setWindowTitle("AirFruit · 隔空切水果")
         self.setFixedSize(GAME_W, GAME_H)
@@ -38,12 +37,18 @@ class GameWindow(QWidget):
         self._last_tick = self._t0
         self._tick_times: list[float] = []
         self._paint_times: list[float] = []
-        self._pulse_t = 0.0  # dt-integrated demo animation (M1 placeholder)
+        self._pulse_t = 0.0  # dt-integrated idle animation
         self.tick_count = 0
         self.paint_count = 0
 
         self._bg: QPixmap | None = None
         self._make_background()
+
+        # --- vision layer (M2) ---
+        self.vision_shared = SharedVisionState()
+        self._vision = VisionThread(self.vision_shared, camera_index=camera_index, synthetic=use_synthetic)
+        self._vis: tuple = ([], None, "init", 0.0, 0, 0)
+        self._vision_started = False
 
         self._timer = QTimer(self)
         self._timer.setInterval(16)  # ~60 Hz request
@@ -53,6 +58,20 @@ class GameWindow(QWidget):
 
     def start(self) -> None:
         self._timer.start()
+        self._vision.start()
+        self._vision_started = True
+
+    def shutdown(self) -> None:
+        """Idempotent stop of both loops; safe from closeEvent and selftest."""
+        if self._timer.isActive():
+            self._timer.stop()
+        if self._vision_started:
+            self._vision.stop()
+            self._vision_started = False
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.shutdown()
+        super().closeEvent(event)
 
     def _tick(self) -> None:
         now = time.perf_counter()
@@ -62,6 +81,7 @@ class GameWindow(QWidget):
         self.tick_count += 1
 
         self._pulse_t += dt
+        self._vis = self.vision_shared.snapshot()
         self.update()
 
     # ---- painting ----
@@ -74,7 +94,6 @@ class GameWindow(QWidget):
         grad.setColorAt(0.0, QColor(18, 24, 38))
         grad.setColorAt(1.0, QColor(8, 10, 16))
         p.fillRect(0, 0, GAME_W, GAME_H, grad)
-        # warm floor glow, hinting where fruits will rise
         glow = QRadialGradient(GAME_W / 2, GAME_H + 120, GAME_H)
         glow.setColorAt(0.0, QColor(255, 120, 60, 60))
         glow.setColorAt(1.0, QColor(0, 0, 0, 0))
@@ -90,27 +109,50 @@ class GameWindow(QWidget):
         p = QPainter(self)
         p.drawPixmap(0, 0, self._bg)
 
-        # dt-driven pulse circle: placeholder for real entities, and proof
-        # that the loop integrates time (radius depends on _pulse_t, not frame no.)
-        r = 60 + 18 * math.sin(self._pulse_t * 2 * math.pi * 0.5)
-        cx, cy = GAME_W / 2, GAME_H / 2
-        pen = QPen(QColor(255, 170, 60))
-        pen.setWidth(3)
-        p.setPen(pen)
-        p.setBrush(QColor(255, 170, 60, 40))
-        p.drawEllipse(int(cx - r), int(cy - r), int(2 * r), int(2 * r))
-        p.setBrush(Qt.NoBrush)
+        blades, preview, status, infer_ms, vis_hz, _total = self._vis
 
-        self._draw_hud(p)
+        # idle placeholder while no blade is tracked; replaced by trail in M3
+        if not blades:
+            r = 60 + 18 * math.sin(self._pulse_t * 2 * math.pi * 0.5)
+            cx, cy = GAME_W / 2, GAME_H / 2
+            pen = QPen(QColor(255, 170, 60))
+            pen.setWidth(3)
+            p.setPen(pen)
+            p.setBrush(QColor(255, 170, 60, 40))
+            p.drawEllipse(int(cx - r), int(cy - r), int(2 * r), int(2 * r))
+            p.setBrush(Qt.NoBrush)
 
-    def _draw_hud(self, p: QPainter) -> None:
+        for b in blades:
+            x, y = b.x * GAME_W, b.y * GAME_H
+            pen = QPen(QColor(255, 200, 80))
+            pen.setWidth(2)
+            p.setPen(pen)
+            p.setBrush(QColor(255, 200, 80, 60))
+            p.drawEllipse(int(x - 12), int(y - 12), 24, 24)
+            p.setBrush(Qt.NoBrush)
+            p.drawLine(int(x - 20), int(y), int(x + 20), int(y))
+            p.drawLine(int(x), int(y - 20), int(x), int(y + 20))
+
+        if preview is not None:
+            img = QImage(preview, PREVIEW_W, PREVIEW_H, 3 * PREVIEW_W, QImage.Format.Format_BGR888)
+            px_, py_ = GAME_W - PREVIEW_W - 16, GAME_H - PREVIEW_H - 16
+            p.drawImage(px_, py_, img)
+            p.setPen(QPen(QColor(90, 90, 90)))
+            p.drawRect(px_, py_, PREVIEW_W, PREVIEW_H)
+
+        self._draw_hud(p, status, infer_ms, vis_hz, len(blades))
+
+    def _draw_hud(self, p: QPainter, status: str, infer_ms: float, vis_hz: int, n_blades: int) -> None:
         fps = self.paint_fps()
         ms = self.frame_ms()
         p.setPen(QColor(230, 230, 230))
         p.setFont(QFont("Microsoft YaHei", 13))
         p.drawText(16, 26, f"FPS {fps:5.1f}   frame {ms:4.1f} ms   ticks {self.tick_count}")
         p.setPen(QColor(150, 150, 150))
-        p.drawText(16, 48, "M1 渲染骨架 · 视觉线程待接入")
+        p.drawText(16, 48, "M2 视觉接入 · 刀光 M3")
+        if status == "camera_open_failed" or status.startswith("camera_"):
+            p.setPen(QColor(255, 120, 90))
+        p.drawText(16, 70, f"vision: {status}   {vis_hz} Hz   infer {infer_ms:4.1f} ms   blades {n_blades}")
 
     # ---- stats (sliding 1-second windows) ----
 
