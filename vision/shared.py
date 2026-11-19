@@ -31,6 +31,7 @@ class SharedVisionState:
         self.preview_bgr: bytes | None = None
         self.status = "init"
         self.infer_ms: float = 0.0
+        self.pub_t: float = 0.0  # perf_counter of the last publish (new-sample marker)
         self._samples: deque[float] = deque(maxlen=120)
         self.sample_count = 0
 
@@ -40,7 +41,8 @@ class SharedVisionState:
             self.preview_bgr = preview_bgr
             self.infer_ms = infer_ms
             self.status = "ok"
-            self._samples.append(time.perf_counter())
+            self.pub_t = time.perf_counter()
+            self._samples.append(self.pub_t)
             self.sample_count += 1
 
     def publish_status(self, status: str) -> None:
@@ -48,7 +50,7 @@ class SharedVisionState:
             self.status = status
 
     def snapshot(self):
-        """(blades, preview_bgr, status, infer_ms, hz_last_1s, total_samples)."""
+        """(blades, preview_bgr, status, infer_ms, hz_last_1s, total, pub_t)."""
         with self._lock:
             now = time.perf_counter()
             while self._samples and now - self._samples[0] > 1.0:
@@ -60,4 +62,5 @@ class SharedVisionState:
                 self.infer_ms,
                 len(self._samples),
                 self.sample_count,
+                self.pub_t,
             )

@@ -21,10 +21,12 @@ from PySide6.QtGui import (
 )
 from PySide6.QtWidgets import QWidget
 
+from game.trail import BladeTrail
 from vision.shared import PREVIEW_W, PREVIEW_H, SharedVisionState
 from vision.thread import VisionThread
 
 GAME_W, GAME_H = 1280, 720
+DEMO_PUSH_PERIOD = 1.0 / 30.0  # trail demo feeds the trail at vision rate
 
 
 class GameWindow(QWidget):
@@ -47,8 +49,17 @@ class GameWindow(QWidget):
         # --- vision layer (M2) ---
         self.vision_shared = SharedVisionState()
         self._vision = VisionThread(self.vision_shared, camera_index=camera_index, synthetic=use_synthetic)
-        self._vis: tuple = ([], None, "init", 0.0, 0, 0)
+        self._vis: tuple = ([], None, "init", 0.0, 0, 0, 0.0)
         self._vision_started = False
+
+        # --- blade trails (M3) ---
+        self._trails = [BladeTrail(), BladeTrail()]
+        self._last_pub_t = 0.0
+        # synthetic vision sees no person, so the selftest feeds the trails a
+        # scripted two-hand sweep instead — this exercises the M3 render path.
+        self._trail_demo = use_synthetic
+        self._demo_t = 0.0
+        self._demo_acc = 0.0
 
         self._timer = QTimer(self)
         self._timer.setInterval(16)  # ~60 Hz request
@@ -82,7 +93,35 @@ class GameWindow(QWidget):
 
         self._pulse_t += dt
         self._vis = self.vision_shared.snapshot()
+        self._feed_trails(dt)
         self.update()
+
+    def _feed_trails(self, dt: float) -> None:
+        """Push the newest blade samples into the trails.
+
+        Real mode: a new vision publish is detected by a changed pub_t; each
+        hand index present in the publish extends its trail (the other one
+        just stops receiving and fades out). Demo mode (synthetic vision sees
+        no person): a scripted two-hand sweep at the vision rate, so
+        --selftest exercises the full M3 render path.
+        """
+        now = time.perf_counter()
+        if self._trail_demo:
+            self._demo_t += dt
+            self._demo_acc += dt
+            if self._demo_acc >= DEMO_PUSH_PERIOD:
+                self._demo_acc = 0.0
+                for k in range(2):
+                    x = GAME_W * (0.5 + 0.35 * math.sin(self._demo_t * 1.7 + k * math.pi))
+                    y = GAME_H * (0.5 + 0.28 * math.sin(self._demo_t * 2.3 + k * 1.2))
+                    self._trails[k].push(x, y, now)
+            return
+        blades, _preview, _status, _infer, _hz, _total, pub_t = self._vis
+        if pub_t == self._last_pub_t:
+            return  # same vision sample: nothing new to push
+        self._last_pub_t = pub_t
+        for k, b in enumerate(blades[:2]):
+            self._trails[k].push(b.x * GAME_W, b.y * GAME_H, pub_t)
 
     # ---- painting ----
 
@@ -109,10 +148,15 @@ class GameWindow(QWidget):
         p = QPainter(self)
         p.drawPixmap(0, 0, self._bg)
 
-        blades, preview, status, infer_ms, vis_hz, _total = self._vis
+        blades, preview, status, infer_ms, vis_hz, _total, _pub_t = self._vis
 
-        # idle placeholder while no blade is tracked; replaced by trail in M3
-        if not blades:
+        # M3 blade trails: fade-out tail + extrapolated tip between samples
+        for trail in self._trails:
+            trail.draw(p, now)
+        n_trail_pts = sum(t.stats()["points"] for t in self._trails)
+
+        # idle placeholder only while nothing is tracked at all
+        if not blades and n_trail_pts == 0:
             r = 60 + 18 * math.sin(self._pulse_t * 2 * math.pi * 0.5)
             cx, cy = GAME_W / 2, GAME_H / 2
             pen = QPen(QColor(255, 170, 60))
@@ -149,7 +193,7 @@ class GameWindow(QWidget):
         p.setFont(QFont("Microsoft YaHei", 13))
         p.drawText(16, 26, f"FPS {fps:5.1f}   frame {ms:4.1f} ms   ticks {self.tick_count}")
         p.setPen(QColor(150, 150, 150))
-        p.drawText(16, 48, "M2 视觉接入 · 刀光 M3")
+        p.drawText(16, 48, "M3 刀光轨迹 · 玩法 M4")
         if status == "camera_open_failed" or status.startswith("camera_"):
             p.setPen(QColor(255, 120, 90))
         p.drawText(16, 70, f"vision: {status}   {vis_hz} Hz   infer {infer_ms:4.1f} ms   blades {n_blades}")
@@ -184,4 +228,5 @@ class GameWindow(QWidget):
             "paints": self.paint_count,
             "avg_tick_fps": self.tick_count / elapsed,
             "avg_paint_fps": self.paint_count / elapsed,
+            "trail_points": max((t.stats()["points"] for t in self._trails), default=0),
         }
