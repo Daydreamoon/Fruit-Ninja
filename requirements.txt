@@ -1,0 +1,8 @@
+# AirFruit 运行依赖（M0 实测锁定版本，2026-11-19）
+# 本机安装方式（pip 走 Clash fake-IP 链路会卡死，必须用 uv）：
+#   uv pip install --python .venv\Scripts\python.exe -r requirements.txt --index-url https://pypi.tuna.tsinghua.edu.cn/simple
+mediapipe==1.2.3
+opencv-contrib-python==4.14.0.94
+numpy==2.5.5
+pyside6==6.12.0
+# 间接依赖（pillow/sounddevice/shiboken6 等）由 uv/pip 自动解析
