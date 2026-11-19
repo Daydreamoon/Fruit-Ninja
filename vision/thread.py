@@ -11,6 +11,7 @@ the frame is mirrored here, so x is already in the player's view.
 """
 from __future__ import annotations
 
+import sys
 import threading
 import time
 
@@ -56,9 +57,15 @@ class VisionThread(QThread):
         so a broken MSMF stack still falls back to DSHOW.
         """
         for backend in (cv2.CAP_MSMF, cv2.CAP_DSHOW):
+            t_backend = time.monotonic()
             cap = cv2.VideoCapture(self.camera_index, backend)
             if not cap.isOpened():
                 cap.release()
+                print(
+                    f"[vision] backend {backend} unavailable ({time.monotonic() - t_backend:.1f}s)",
+                    file=sys.stderr,
+                    flush=True,
+                )
                 continue
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_W)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_H)
@@ -69,8 +76,18 @@ class VisionThread(QThread):
             while time.monotonic() < deadline:
                 ok, _ = cap.read()
                 if ok:
+                    print(
+                        f"[vision] backend {backend} opened in {time.monotonic() - t_backend:.1f}s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                     return cap
             cap.release()
+            print(
+                f"[vision] backend {backend} gave no frame in {FIRST_FRAME_TIMEOUT_S}s",
+                file=sys.stderr,
+                flush=True,
+            )
         return None
 
     def _make_landmarker(self):
@@ -96,17 +113,23 @@ class VisionThread(QThread):
     # ---- main loop ----
 
     def run(self) -> None:  # QThread entry
+        import sys
+
+        t_setup = time.monotonic()
         try:
             self.shared.publish_status("loading_model")
             landmarker = self._make_landmarker()
         except Exception as exc:  # noqa: BLE001
             self.shared.publish_status(f"model_error: {type(exc).__name__}")
             return
+        print(f"[vision] model ready in {time.monotonic() - t_setup:.1f}s", file=sys.stderr, flush=True)
 
         cap = None
         if not self.synthetic:
             self.shared.publish_status("opening_camera")
+            t_cam = time.monotonic()
             cap = self._open_camera()
+            print(f"[vision] camera open in {time.monotonic() - t_cam:.1f}s", file=sys.stderr, flush=True)
             if cap is None:
                 # camera-level failure; user-visible status, render loop unaffected
                 self.shared.publish_status("camera_open_failed")
@@ -115,7 +138,6 @@ class VisionThread(QThread):
         import mediapipe as mp
 
         self.shared.publish_status("starting")
-        import sys
 
         t_start = time.perf_counter()
         ts = 0

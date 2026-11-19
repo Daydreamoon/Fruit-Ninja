@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import time
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QRect, Qt, QTimer
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -117,14 +117,18 @@ class GameWindow(QWidget):
         self._feed_trails(dt)
 
         # --- M4 game step: physics/waves, then blade-vs-fruit collisions ---
-        self.state.update(dt)
-        if not self.state.game_over:
-            now = time.perf_counter()
-            segs: list[tuple[float, float, float, float]] = []
-            for tr in self._trails:
-                segs.extend(tr.collision_segments(now))
-            if segs:
-                self.state.collide_blade(segs)
+        # Real-camera start-up takes a few seconds (model + camera). Freezing the
+        # world until vision reports "ok" keeps the first round fair: no fruit is
+        # spawned (and missed) while the player cannot see their own hands yet.
+        if self._world_ready():
+            self.state.update(dt)
+            if not self.state.game_over:
+                now = time.perf_counter()
+                segs: list[tuple[float, float, float, float]] = []
+                for tr in self._trails:
+                    segs.extend(tr.collision_segments(now))
+                if segs:
+                    self.state.collide_blade(segs)
         self._flush_audio_events()
         self.update()
         if self.recorder is not None and self.recorder.status == "recording":
@@ -150,6 +154,16 @@ class GameWindow(QWidget):
                 QTimer.singleShot(450, lambda: self.audio.play("gameover"))
             else:
                 self.audio.play(name)
+
+    def _world_ready(self) -> bool:
+        """True once blades can actually arrive (synthetic mode is always ready).
+
+        Camera start-up costs a few seconds; spawning fruit before that would
+        hand the player a pile of unavoidable misses.
+        """
+        if self._trail_demo:
+            return True
+        return self._vis[2] == "ok"
 
     def _feed_trails(self, dt: float) -> None:
         """Push the newest blade samples into the trails.
@@ -247,6 +261,22 @@ class GameWindow(QWidget):
             p.setBrush(QColor(255, 170, 60, 40))
             p.drawEllipse(int(cx - r), int(cy - r), int(2 * r), int(2 * r))
             p.setBrush(Qt.NoBrush)
+
+        # real-camera warm-up hint: say what we are waiting for instead of
+        # letting the player stare at an empty field
+        if not self._world_ready():
+            ready_text = {
+                "loading_model": "正在加载姿态模型…",
+                "opening_camera": "正在打开摄像头…",
+                "starting": "正在启动识别…",
+            }.get(status, f"视觉未就绪（{status}）")
+            p.setFont(QFont("Microsoft YaHei", 22, QFont.Weight.Bold))
+            p.setPen(QColor(255, 210, 120))
+            p.drawText(
+                QRect(0, int(GAME_H * 0.42), GAME_W, 60),
+                Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                ready_text + "  请把手举到镜头前",
+            )
 
         for b in blades:
             x, y = b.x * GAME_W, b.y * GAME_H

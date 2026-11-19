@@ -40,7 +40,7 @@ D:\FruitNinjaEnv\Scripts\python main.py --selftest 25 --visible --record demo/ai
 D:\FruitNinjaEnv\Scripts\python vision\probes.py --camera   # 摄像头/后端体检
 ```
 
-首次运行会自动下载姿态模型到 `models/`（约 5.5 MB）。录屏请用 `--visible`：离屏模式没有字体，HUD 会渲染成豆腐块。
+首次运行会自动下载姿态模型到 `models/`（约 5.5 MB）。**真机模式启动需要约 10 秒**（摄像头冷启动 3~10s + 模型 1.8s），期间画面中央会提示"正在打开摄像头… 请把手举到镜头前"，就绪后提示消失、水果才开始出现。录屏请用 `--visible`：离屏模式没有字体，HUD 会渲染成豆腐块。
 
 ## 里程碑自测
 
