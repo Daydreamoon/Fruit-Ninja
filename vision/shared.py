@@ -20,6 +20,7 @@ class BladePoint:
     x: float  # normalized 0..1, mirrored (player view)
     y: float
     visibility: float
+    side: str = "right"  # "left" / "right": stable identity so trails don't swap
 
 
 class SharedVisionState:

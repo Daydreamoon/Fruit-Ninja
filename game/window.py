@@ -32,6 +32,8 @@ from vision.thread import VisionThread
 GAME_W, GAME_H = 1280, 720
 DEMO_PUSH_PERIOD = 1.0 / 30.0  # trail demo feeds the trail at vision rate
 DEMO_BLADE_SPEED = 4200.0  # px/s — fast enough to reach a falling fruit
+HAND_LABELS = {"left": "左手", "right": "右手"}
+HAND_MODE_LABELS = {"auto": "自动（举起来的手）", "left": "只认左手", "right": "只认右手"}
 
 # Camera-box -> screen mapping. The default maps most of the frame; a 3 second
 # auto-calibration at start-up shrinks it to the box the player's hands
@@ -77,6 +79,7 @@ class GameWindow(QWidget):
         self._tick_times: list[float] = []
         self._paint_times: list[float] = []
         self._pulse_t = 0.0  # dt-integrated idle animation
+        self.hand_mode = "auto"  # auto | left | right (H / 1 / 2 / 3 keys)
         self.tick_count = 0
         self.paint_count = 0
 
@@ -90,7 +93,9 @@ class GameWindow(QWidget):
         self._vision_started = False
 
         # --- blade trails (M3) ---
-        self._trails = [BladeTrail(), BladeTrail()]
+        # keyed by side: a hand keeps its own trail even when the other one
+        # leaves, so a single-hand player never inherits a stale second blade
+        self._trails: dict[str, BladeTrail] = {"left": BladeTrail(), "right": BladeTrail()}
         self._last_pub_t = 0.0
         # synthetic vision sees no person, so the selftest feeds the trails a
         # scripted two-hand sweep instead — this exercises the M3 render path.
@@ -105,7 +110,10 @@ class GameWindow(QWidget):
         self._calib_done_t: float | None = None
         self._calib_pts: list[tuple[float, float]] = []
         # scripted hands chase fruit, so the synthetic selftest slices reliably
-        self._demo_pos = [(GAME_W * 0.5, GAME_H * 0.62), (GAME_W * 0.5, GAME_H * 0.38)]
+        self._demo_pos = {
+            "left": (GAME_W * 0.42, GAME_H * 0.62),
+            "right": (GAME_W * 0.58, GAME_H * 0.38),
+        }
 
         # --- game state (M4) ---
         self.state = GameState()
@@ -142,6 +150,25 @@ class GameWindow(QWidget):
         self.shutdown()
         super().closeEvent(event)
 
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        """Hand-mode override: the automatic rules (raised + moving) cover the
+        usual case, a key is the escape hatch when they guess wrong."""
+        key = event.key()
+        if key in (Qt.Key.Key_H, Qt.Key.Key_H_multiple):
+            order = ["auto", "left", "right"]
+            self.hand_mode = order[(order.index(self.hand_mode) + 1) % len(order)]
+        elif key == Qt.Key.Key_1:
+            self.hand_mode = "left"
+        elif key == Qt.Key.Key_2:
+            self.hand_mode = "right"
+        elif key == Qt.Key.Key_3:
+            self.hand_mode = "auto"
+        else:
+            super().keyPressEvent(event)
+            return
+        print(f"[AirFruit] 用手模式：{HAND_MODE_LABELS[self.hand_mode]}", file=sys.stderr, flush=True)
+        self.update()
+
     def _tick(self) -> None:
         now = time.perf_counter()
         dt = min(now - self._last_tick, 0.05)  # clamp stalls (window drags etc.)
@@ -151,6 +178,13 @@ class GameWindow(QWidget):
 
         self._pulse_t += dt
         self._vis = self.vision_shared.snapshot()
+        if self.hand_mode != "auto":
+            # manual override: keep only the chosen hand, downstream code paths
+            # (calibration, trails, cursors, preview dots) then all agree
+            self._vis = (
+                [b for b in self._vis[0] if b.side == self.hand_mode],
+                *self._vis[1:],
+            )
         if self._vis[0]:
             self._last_blade_t = now
         self._update_calibration(now)
@@ -166,7 +200,7 @@ class GameWindow(QWidget):
             if not self.state.game_over:
                 now = time.perf_counter()
                 segs: list[tuple[float, float, float, float]] = []
-                for tr in self._trails:
+                for tr in self._trails.values():
                     segs.extend(tr.collision_segments(now))
                 if segs:
                     self.state.collide_blade(segs)
@@ -220,8 +254,8 @@ class GameWindow(QWidget):
         targets = sorted(
             (f for f in self.state.fruits if f.value > 0), key=lambda f: f.y, reverse=True
         )
-        for k in range(2):
-            x, y = self._demo_pos[k]
+        for k, side in enumerate(("left", "right")):
+            x, y = self._demo_pos[side]
             if k < len(targets):
                 tx, ty = targets[k].x, targets[k].y
             else:  # idle sweep while waiting for the next wave
@@ -233,8 +267,8 @@ class GameWindow(QWidget):
                 step = min(dist, DEMO_BLADE_SPEED * DEMO_PUSH_PERIOD)
                 x += dx / dist * step
                 y += dy / dist * step
-            self._demo_pos[k] = (x, y)
-            self._trails[k].push(x, y, now)
+            self._demo_pos[side] = (x, y)
+            self._trails[side].push(x, y, now)
 
     def _update_calibration(self, now: float) -> None:
         """Learn the box where this player's hands move (3 s, once, at start).
@@ -304,9 +338,12 @@ class GameWindow(QWidget):
         if pub_t == self._last_pub_t:
             return  # same vision sample: nothing new to push
         self._last_pub_t = pub_t
-        for k, b in enumerate(blades[:2]):
+        for b in blades:
+            trail = self._trails.get(b.side)
+            if trail is None:
+                continue
             sx, sy = self._map_blade(b)
-            self._trails[k].push(sx * GAME_W, sy * GAME_H, pub_t)
+            trail.push(sx * GAME_W, sy * GAME_H, pub_t)
 
     # ---- painting ----
 
@@ -337,9 +374,9 @@ class GameWindow(QWidget):
         blades, preview, status, infer_ms, vis_hz, _total, _pub_t = self._vis
 
         # M3 blade trails: fade-out tail + extrapolated tip between samples
-        for trail in self._trails:
+        for trail in self._trails.values():
             trail.draw(p, now)
-        n_trail_pts = sum(t.stats()["points"] for t in self._trails)
+        n_trail_pts = sum(t.stats()["points"] for t in self._trails.values())
 
         # --- M4 game objects ---
         st = self.state
@@ -420,13 +457,20 @@ class GameWindow(QWidget):
         # where the blade currently is: the published hand points in live mode,
         # the extrapolated trail tip in demo mode (synthetic vision has no hands)
         if blades:
-            cursors = [tuple(v * s for v, s in zip(self._map_blade(b), (GAME_W, GAME_H))) for b in blades]
+            cursors = [
+                (b.side, *[v * s for v, s in zip(self._map_blade(b), (GAME_W, GAME_H))])
+                for b in blades
+            ]
         elif self._trail_demo:
-            cursors = [t.tip(now) for t in self._trails if t.stats()["points"] > 0]
+            cursors = [
+                (side, *t.tip(now))
+                for side, t in self._trails.items()
+                if t.stats()["points"] > 0
+            ]
         else:
             cursors = []
 
-        for idx, (x, y) in enumerate(cursors):
+        for side, x, y in cursors:
             # big pulsing reticle: at 60fps a 24px circle reads as "a dot you
             # cannot find" -- the player must see where their hand maps to
             pulse = 0.5 + 0.5 * math.sin(self._pulse_t * 2 * math.pi * 0.8)
@@ -444,7 +488,7 @@ class GameWindow(QWidget):
             p.drawLine(int(x), int(y + outer), int(x), int(y + outer + 12))
             p.setFont(QFont("Microsoft YaHei", 12, QFont.Weight.Bold))
             p.setPen(QColor(255, 220, 140, 200))
-            p.drawText(int(x + outer + 6), int(y - outer), f"手{idx + 1}")
+            p.drawText(int(x + outer + 6), int(y - outer), HAND_LABELS.get(side, side))
 
         # the preview is a real-camera aid; in demo mode there is none to show
         if preview is not None and not self._trail_demo:
@@ -543,8 +587,10 @@ class GameWindow(QWidget):
         if status == "camera_open_failed" or status.startswith("camera_"):
             p.setPen(QColor(255, 120, 90))
         p.drawText(16, 70, f"vision: {status}   {vis_hz} Hz   infer {infer_ms:4.1f} ms   blades {n_blades}")
+        p.setPen(QColor(150, 150, 150))
+        p.drawText(16, 92, f"用手：{HAND_MODE_LABELS[self.hand_mode]}   按键 H 切换 / 1 左手 / 2 右手 / 3 自动")
         p.setPen(QColor(255, 230, 140))
-        p.drawText(16, 92, self.state.hud())
+        p.drawText(16, 114, self.state.hud())
 
     # ---- stats (sliding 1-second windows) ----
 
@@ -576,7 +622,9 @@ class GameWindow(QWidget):
             "paints": self.paint_count,
             "avg_tick_fps": self.tick_count / elapsed,
             "avg_paint_fps": self.paint_count / elapsed,
-            "trail_points": max((t.stats()["points"] for t in self._trails), default=0),
+            "trail_points": max(
+                (t.stats()["points"] for t in self._trails.values()), default=0
+            ),
             "game": self.state.stats.as_dict(),
             "audio": self.audio.status,
             "muted": self.audio.muted,

@@ -4,13 +4,21 @@ Runs a tight loop in its own QThread: read frame -> mirror -> detect ->
 extract blade points -> publish to SharedVisionState. The render thread
 never touches OpenCV or MediaPipe.
 
-Blade mapping follows the reference project: midpoint of each hand's
-pinky (17/18) and index (19/20) pose landmarks; both hands can be blades
-(anti-mistouch decision from the plan). Coordinates stay normalized;
-the frame is mirrored here, so x is already in the player's view.
+The blade is the PALM CENTRE of each hand: the mean of that arm's wrist (15/16),
+pinky MCP (17/18) and index MCP (19/20) pose landmarks. The earlier midpoint of
+index+pinky sat between two fingers, which read as "the cursor is not on my
+hand" during play. Coordinates stay normalized; the frame is mirrored here, so
+x is already in the player's view.
+
+A hand only counts as a blade while it is being used (see _extract_hands):
+raised rather than hanging below its elbow, and moving at least occasionally.
+That is what makes "one hand playing, the other one resting on the desk" show
+a single blade instead of two.
 """
 from __future__ import annotations
 
+import math
+import os
 import sys
 import threading
 import time
@@ -21,8 +29,24 @@ from PySide6.QtCore import QThread
 
 from .shared import PREVIEW_W, PREVIEW_H, BladePoint, SharedVisionState
 
-BLADE_PAIRS = ((17, 19), (18, 20))  # (pinky, index) per arm
-VISIBILITY_MIN = 0.35  # 0.5 was too strict: hands in motion kept dropping out
+# (side, wrist, pinky MCP, index MCP) -- pose landmark indices, left/right in
+# the PERSON's own frame (MediaPipe's convention), which keeps the two hands
+# distinguishable when only one of them is in play.
+PALM_TRIPLES = (
+    ("left", 15, 17, 19),
+    ("right", 16, 18, 20),
+)
+ELBOWS = {"left": 13, "right": 14}
+VISIBILITY_MIN = 0.50  # to start tracking a hand
+VISIBILITY_KEEP = 0.35  # to keep tracking one already tracked (hysteresis)
+HAND_HOLD_S = 0.35  # a hand that blinks out keeps its last point this long
+RAISE_ACQUIRE = 0.02  # to start using a hand: wrist at least this far above the elbow
+RAISE_KEEP = 0.10  # to keep using it: the wrist may sag a little below
+IDLE_S = 2.0  # a hand not moving for this long counts as put down...
+IDLE_SPEED = 0.004  # ...where "moving" means this much of the frame per sample
+SPEED_ALPHA = 0.12  # smoothing for the per-hand speed estimate
+SMOOTH_ALPHA = 0.55  # palm-centre EMA: pose jitter would otherwise wobble the blade
+_DEBUG_HANDS = os.environ.get("AIRFRUIT_DEBUG_HANDS", "").lower() in ("1", "true", "yes", "on")
 CAMERA_W, CAMERA_H = 1280, 720
 FIRST_FRAME_TIMEOUT_S = 1.5  # give a backend this long to deliver its first frame
 
@@ -39,6 +63,10 @@ class VisionThread(QThread):
         self.camera_index = camera_index
         self.synthetic = synthetic
         self._stop = threading.Event()
+        # per-side tracking state, keyed "left"/"right":
+        # {x, y, seen, anchor_x, anchor_y, anchor_t}
+        self._hands: dict[str, dict] = {}
+        self._noted: dict[str, str] = {}  # debug: last printed state per side
 
     # ---- public ----
 
@@ -110,6 +138,118 @@ class VisionThread(QThread):
         )
         return vision.PoseLandmarker.create_from_options(options)
 
+    # ---- blade extraction ----
+
+    def _extract_hands(self, lms, now: float) -> list[BladePoint]:
+        """Turn one pose result into blade points: palm centre per hand in play.
+
+        Rules, in order:
+        * visibility (min of wrist/MCPs) above the acquire threshold, or above
+          the lower "keep" threshold for a hand already tracked -- hysteresis,
+          because a hand in motion repeatedly dips below a single cutoff;
+        * the hand must be raised: the wrist may not sit much below its elbow,
+          which is what distinguishes a playing hand from an arm resting on the
+          desk / hanging beside the chair;
+        * a hand motionless for IDLE_S counts as put down (a resting hand on the
+          desk is almost perfectly still). Any movement brings it straight back;
+        * a hand that drops out keeps coasting for HAND_HOLD_S so a one-frame
+          detection gap does not make the blade blink.
+        """
+        out: dict[str, BladePoint] = {}
+        for side, wrist_i, pinky_i, index_i in PALM_TRIPLES:
+            w, p, q = lms[wrist_i], lms[pinky_i], lms[index_i]
+            vis = min(w.visibility, p.visibility, q.visibility)
+            st = self._hands.get(side)
+            if vis < (VISIBILITY_KEEP if st else VISIBILITY_MIN):
+                self._note(side, f"invisible vis={vis:.2f}")
+                continue
+            if not self._is_raised(lms, side, w.y, acquiring=st is None):
+                self._note(side, "lowered (wrist below elbow)")
+                continue
+            # palm centre: wrist + the two knuckles average to the middle of the
+            # palm, unlike the finger midpoint used earlier
+            cx = (w.x + p.x + q.x) / 3.0
+            cy = (w.y + p.y + q.y) / 3.0
+            if st is None:
+                st = self._hands[side] = {
+                    "x": cx,
+                    "y": cy,
+                    "rx": cx,  # last raw (unsmoothed) sample
+                    "ry": cy,
+                    "seen": now,
+                    "speed": 0.0,  # smoothed per-sample displacement
+                    "still": now,
+                }
+            else:
+                # per-sample displacement BEFORE smoothing: a resting hand only
+                # jitters by a fraction of a percent, a playing one covers whole
+                # percent per frame. This, not raw position, separates the two.
+                step = math.hypot(cx - st["rx"], cy - st["ry"])
+                st["speed"] += (step - st["speed"]) * SPEED_ALPHA
+                st["rx"], st["ry"] = cx, cy
+                st["x"] += (cx - st["x"]) * SMOOTH_ALPHA
+                st["y"] += (cy - st["y"]) * SMOOTH_ALPHA
+                st["seen"] = now
+                if st["speed"] >= IDLE_SPEED:
+                    st["still"] = now
+            if now - st["still"] <= IDLE_S:
+                out[side] = BladePoint(x=st["x"], y=st["y"], visibility=vis, side=side)
+                self._note(side, f"active vis={vis:.2f} speed={st['speed']:.4f}")
+            else:
+                self._note(side, f"idle vis={vis:.2f} speed={st['speed']:.4f}")
+        # coast / retire hands that were not refreshed this frame
+        for side, st in list(self._hands.items()):
+            if side in out:
+                continue
+            if now - st["seen"] <= HAND_HOLD_S:
+                out[side] = BladePoint(x=st["x"], y=st["y"], visibility=0.0, side=side)
+            else:
+                del self._hands[side]
+        # stable order: left first, so the renderer's labels never swap
+        return [out[s] for s in ("left", "right") if s in out]
+
+    @staticmethod
+    def _is_raised(lms, side: str, wrist_y: float, acquiring: bool) -> bool:
+        """Playing hand vs arm put down, with hysteresis.
+
+        Acquiring is strict (the wrist must be clearly above the elbow);
+        keeping is lenient (it may sag a little below). Without the gap the
+        gate flip-flops every frame near the boundary -- the pose elbow estimate
+        jitters by a few percent and the blade would blink on and off.
+        """
+        elbow = lms[ELBOWS[side]]
+        if elbow.visibility < VISIBILITY_KEEP:
+            return True  # elbow hidden behind the desk: do not punish the hand
+        margin = RAISE_ACQUIRE if acquiring else RAISE_KEEP
+        return wrist_y <= elbow.y + margin
+
+    def _log_speeds(self) -> None:
+        """Debug: per-hand speed vs the idle threshold, every 60 frames."""
+        parts = []
+        for side in ("left", "right"):
+            st = self._hands.get(side)
+            if st is None:
+                parts.append(f"{side}=none")
+            else:
+                still = time.perf_counter() - st["still"]
+                parts.append(f"{side}=speed {st['speed']:.4f} still {still:.1f}s")
+        print("[speed] " + "  ".join(parts), file=sys.stderr, flush=True)
+
+    def _note(self, side: str, state: str) -> None:
+        """Print per-hand decisions when AIRFRUIT_DEBUG_HANDS is set.
+
+        "Why does the game still show two hands?" is impossible to answer from
+        the outside; this prints the reason each side is (not) a blade without
+        spamming: only transitions are reported.
+        """
+        if not _DEBUG_HANDS:
+            return
+        prev = self._noted.get(side)
+        bucket = state.split(" ")[0]
+        if bucket != prev:
+            self._noted[side] = bucket
+            print(f"[hands] {side}: {state}", file=sys.stderr, flush=True)
+
     # ---- main loop ----
 
     def run(self) -> None:  # QThread entry
@@ -173,21 +313,7 @@ class VisionThread(QThread):
                 blades: list[BladePoint] = []
                 poses = result.pose_landmarks
                 if poses:
-                    lms = poses[0]
-                    for pinky_i, index_i in BLADE_PAIRS:
-                        p, q = lms[pinky_i], lms[index_i]
-                        if p.visibility > VISIBILITY_MIN and q.visibility > VISIBILITY_MIN:
-                            # raw, mirrored camera coordinates (0..1). Turning
-                            # them into screen positions is the render thread's
-                            # job: only it knows where this player's hands sit
-                            # (see the auto-calibration in game/window.py).
-                            blades.append(
-                                BladePoint(
-                                    x=(p.x + q.x) / 2,
-                                    y=(p.y + q.y) / 2,
-                                    visibility=min(p.visibility, q.visibility),
-                                )
-                            )
+                    blades = self._extract_hands(poses[0], time.perf_counter())
                 preview = cv2.resize(frame_bgr, (PREVIEW_W, PREVIEW_H)).tobytes()
                 self.shared.publish(blades, preview, infer_ms)
             except Exception as exc:  # noqa: BLE001
@@ -211,6 +337,8 @@ class VisionThread(QThread):
                 if rem > 0:
                     time.sleep(rem)
             frame_i += 1
+            if _DEBUG_HANDS and frame_i % 60 == 0:
+                self._log_speeds()
 
         print(
             f"[vision] loop exit t={time.perf_counter() - t_start:6.1f}s"

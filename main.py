@@ -169,7 +169,35 @@ def main() -> int:
             exit_code[0] = 0 if ok else 1
             app.quit()
 
-        QTimer.singleShot(int(seconds * 1000), _finish)
+        # Live runs must not start their clock before the pipeline does: the
+        # camera alone takes 2.5-10 s to open, and a 16 s run then only had 6 s
+        # of play left -- the spawn assertion failed on a healthy build. Arm the
+        # timer on the first ready tick, with a watchdog for a camera that never
+        # opens at all.
+        if live_camera:
+            state = {"armed": False, "done": False}
+
+            def _arm() -> None:
+                if state["done"]:
+                    return
+                if win._world_ready():
+                    state["armed"] = True
+                    print(f"SELFTEST clock started (pipeline ready), running {seconds:.0f}s")
+                    QTimer.singleShot(int(seconds * 1000), _finish)
+                    return
+                QTimer.singleShot(100, _arm)
+
+            def _watchdog() -> None:
+                if not state["armed"]:
+                    state["done"] = True
+                    print("SELFTEST vision never became ready -- failing")
+                    exit_code[0] = 1
+                    app.quit()
+
+            QTimer.singleShot(100, _arm)
+            QTimer.singleShot(int((seconds + 30) * 1000), _watchdog)
+        else:
+            QTimer.singleShot(int(seconds * 1000), _finish)
 
     app.exec()
 
