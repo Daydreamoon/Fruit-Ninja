@@ -46,7 +46,8 @@ IDLE_S = 2.0  # a hand not moving for this long counts as put down...
 IDLE_SPEED = 0.004  # ...where "moving" means this much of the frame per sample
 SPEED_ALPHA = 0.12  # smoothing for the per-hand speed estimate
 SMOOTH_ALPHA = 0.55  # palm-centre EMA: pose jitter would otherwise wobble the blade
-MAX_JUMP = 0.22  # per-sample displacement that cannot be a real hand moving
+MAX_JUMP = 0.22  # per-sample displacement that a hand can only make while swiping
+FAST_DIR_COS = 0.35  # ...and only if it keeps going the same way as the sample before
 TELEPORT_DROP_S = 0.6  # a hand that keeps teleporting for this long is not a hand
 TELEPORT_BLOCK_S = 1.5  # ...and is not re-acquired until this long after the drop
 _DEBUG_HANDS = os.environ.get("AIRFRUIT_DEBUG_HANDS", "").lower() in ("1", "true", "yes", "on")
@@ -187,8 +188,12 @@ class VisionThread(QThread):
                 st = self._hands[side] = {
                     "x": cx,
                     "y": cy,
-                    "rx": cx,  # last raw (unsmoothed) sample
+                    "rx": cx,  # last raw (unsmoothed) sample we accepted
                     "ry": cy,
+                    "prx": cx,  # last raw sample at all, for the swipe direction
+                    "pry": cy,
+                    "ux": 0.0,  # unit vector of the last raw step
+                    "uy": 0.0,
                     "seen": now,
                     "speed": 0.0,  # smoothed per-sample displacement
                     "still": now,
@@ -198,12 +203,18 @@ class VisionThread(QThread):
                 # jitters by a fraction of a percent, a playing one covers whole
                 # percent per frame. This, not raw position, separates the two.
                 step = math.hypot(cx - st["rx"], cy - st["ry"])
-                if step > MAX_JUMP:
+                # direction of this raw step vs the previous one: a real swipe
+                # keeps going one way, a hallucinated wrist reverses constantly
+                rdx, rdy = cx - st["prx"], cy - st["pry"]
+                rlen = math.hypot(rdx, rdy)
+                st["prx"], st["pry"] = cx, cy
+                aligned = rlen > 1e-6 and (st["ux"] * rdx + st["uy"] * rdy) / rlen > FAST_DIR_COS
+                if step > MAX_JUMP and not aligned:
                     # A pose model asked for one person still estimates the arm it
-                    # cannot see; that estimate jumps between frames. A real hand
-                    # cannot cross a fifth of the frame in 33 ms (a fast slice is
-                    # ~0.08). Hold the last good point instead of following it, and
-                    # drop the hand entirely if the jumps never stop.
+                    # cannot see; that estimate jumps between frames in no
+                    # consistent direction. A real hand moving fast (a slice) does
+                    # exceed MAX_JUMP -- but it keeps its direction, which is what
+                    # aligned tracks. Hold the point, drop a hand that only jumps.
                     if st.get("tele_since") is None:
                         st["tele_since"] = now
                     if now - st["tele_since"] >= TELEPORT_DROP_S:
@@ -216,6 +227,8 @@ class VisionThread(QThread):
                     self._note(side, f"held jump={step:.2f}")
                     continue
                 st["tele_since"] = None
+                if rlen > 1e-6:
+                    st["ux"], st["uy"] = rdx / rlen, rdy / rlen
                 st["speed"] += (step - st["speed"]) * SPEED_ALPHA
                 st["rx"], st["ry"] = cx, cy
                 st["x"] += (cx - st["x"]) * SMOOTH_ALPHA

@@ -668,6 +668,10 @@ class GameWindow(QWidget):
             "trail_points": max(
                 (t.stats()["points"] for t in self._trails.values()), default=0
             ),
+            # what the game actually uses: with hand_mode "single" this is 1 even
+            # when the camera sees two hands (one of them may be a pose estimate)
+            "blades_in_play": len(self._vis[0]),
+            "hand_mode": self.hand_mode,
             "game": self.state.stats.as_dict(),
             "audio": self.audio.status,
             "muted": self.audio.muted,

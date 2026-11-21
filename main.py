@@ -130,7 +130,13 @@ def main() -> int:
             print(f"SELFTEST avg tick fps={s['avg_tick_fps']:.1f} avg paint fps={s['avg_paint_fps']:.1f}")
             print(f"SELFTEST vision status={status} hz={vis_hz} samples={samples} infer_ms={infer_ms:.1f}")
             if live_camera:
-                print(f"SELFTEST blades_now={len(blades)} (hands visible to the camera)")
+                # two different things, and confusing them made a "one blade"
+                # build look broken: the camera may hand us two hands, while the
+                # game only ever uses blades_in_play of them (hand mode single).
+                print(
+                    f"SELFTEST hands_in_frame={len(blades)}"
+                    f" blades_in_play={s['blades_in_play']} mode={s['hand_mode']}"
+                )
             g = s["game"]
             print(f"SELFTEST trail_points={s['trail_points']}")
             print(f"SELFTEST audio={s['audio']} muted={s['muted']}")

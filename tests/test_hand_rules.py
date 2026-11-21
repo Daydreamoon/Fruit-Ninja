@@ -99,6 +99,21 @@ def test_teleporting_hand_is_held_then_dropped() -> None:
     print("ok  teleporting hand is held then dropped")
 
 
+def test_fast_swipe_is_followed() -> None:
+    """A real slice does exceed MAX_JUMP -- but it keeps its direction."""
+    t = _thread()
+    now = 0.0
+    x = 0.10
+    t._extract_hands(_landmarks(right_xy=(x, 0.40)), now)
+    for dx in (0.05, 0.09, 0.12, 0.30, 0.30):  # ramping up into a swipe
+        now += DT
+        x += dx
+        blades = t._extract_hands(_landmarks(right_xy=(x, 0.40)), now)
+        assert len(blades) == 1, f"swipe sample dropped at x={x:.2f}: {blades}"
+    assert blades[0].x > 0.55, f"blade should have followed the swipe: {blades[0].x}"
+    print("ok  fast same-direction swipe is followed")
+
+
 def test_hand_modes() -> None:
     from PySide6.QtWidgets import QApplication
 
@@ -135,5 +150,6 @@ if __name__ == "__main__":
     test_resting_hand_is_not_a_blade()
     test_lowered_hand_is_not_a_blade()
     test_teleporting_hand_is_held_then_dropped()
+    test_fast_swipe_is_followed()
     test_hand_modes()
     print("ALL HAND RULES OK")
