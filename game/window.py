@@ -33,7 +33,14 @@ GAME_W, GAME_H = 1280, 720
 DEMO_PUSH_PERIOD = 1.0 / 30.0  # trail demo feeds the trail at vision rate
 DEMO_BLADE_SPEED = 4200.0  # px/s — fast enough to reach a falling fruit
 HAND_LABELS = {"left": "左手", "right": "右手"}
-HAND_MODE_LABELS = {"auto": "自动（举起来的手）", "left": "只认左手", "right": "只认右手"}
+HAND_MODE_LABELS = {
+    "single": "单手（只出一把刀）",
+    "both": "双手（两把刀）",
+    "left": "只认左手",
+    "right": "只认右手",
+}
+PRIMARY_VIS_MARGIN = 0.15  # a rival hand must be this much more visible to win
+PRIMARY_SWITCH_S = 0.3  # ...and stay that way this long before the blade moves
 
 # Camera-box -> screen mapping. The default maps most of the frame; a 3 second
 # auto-calibration at start-up shrinks it to the box the player's hands
@@ -79,7 +86,10 @@ class GameWindow(QWidget):
         self._tick_times: list[float] = []
         self._paint_times: list[float] = []
         self._pulse_t = 0.0  # dt-integrated idle animation
-        self.hand_mode = "auto"  # auto | left | right (H / 1 / 2 / 3 keys)
+        self.hand_mode = "single"  # single | both | left | right (H / 1..4 keys)
+        self._primary: str | None = None  # the hand holding the blade in single mode
+        self._primary_rival: str | None = None
+        self._rival_since = 0.0
         self.tick_count = 0
         self.paint_count = 0
 
@@ -154,20 +164,55 @@ class GameWindow(QWidget):
         """Hand-mode override: the automatic rules (raised + moving) cover the
         usual case, a key is the escape hatch when they guess wrong."""
         key = event.key()
-        if key in (Qt.Key.Key_H, Qt.Key.Key_H_multiple):
-            order = ["auto", "left", "right"]
-            self.hand_mode = order[(order.index(self.hand_mode) + 1) % len(order)]
+        if key == Qt.Key.Key_H:
+            self.hand_mode = "both" if self.hand_mode == "single" else "single"
         elif key == Qt.Key.Key_1:
-            self.hand_mode = "left"
+            self.hand_mode = "single"
         elif key == Qt.Key.Key_2:
-            self.hand_mode = "right"
+            self.hand_mode = "both"
         elif key == Qt.Key.Key_3:
-            self.hand_mode = "auto"
+            self.hand_mode = "left"
+        elif key == Qt.Key.Key_4:
+            self.hand_mode = "right"
         else:
             super().keyPressEvent(event)
             return
         print(f"[AirFruit] 用手模式：{HAND_MODE_LABELS[self.hand_mode]}", file=sys.stderr, flush=True)
         self.update()
+
+    def _select_blades(self, blades, now: float):
+        """Decide which detected hands get a blade.
+
+        The default is ONE blade. A pose model asked for one person still puts
+        a wrist on the arm it cannot see, and that estimate drifts around the
+        frame -- which reads as "a second hand waving on its own" although only
+        one hand is in front of the camera. So unless the player asks for two
+        (key 2), only the most confident hand is used, and it is kept sticky
+        instead of being re-picked every frame.
+        """
+        if self.hand_mode in ("left", "right"):
+            return [b for b in blades if b.side == self.hand_mode]
+        if self.hand_mode == "both" or len(blades) <= 1:
+            self._primary = blades[0].side if blades else None
+            self._primary_rival = None
+            return blades
+        cur = next((b for b in blades if b.side == self._primary), None)
+        if cur is None:
+            best = max(blades, key=lambda b: b.visibility)
+            self._primary, self._primary_rival = best.side, None
+            return [best]
+        rival = next((b for b in blades if b.side != cur.side), None)
+        if rival is not None and rival.visibility > cur.visibility + PRIMARY_VIS_MARGIN:
+            # only hand over after the rival has been clearly better for a while:
+            # otherwise two noisy visibility estimates make the blade jump sides
+            if self._primary_rival != rival.side:
+                self._primary_rival, self._rival_since = rival.side, now
+            elif now - self._rival_since >= PRIMARY_SWITCH_S:
+                self._primary, self._primary_rival = rival.side, None
+                return [rival]
+        else:
+            self._primary_rival = None
+        return [cur]
 
     def _tick(self) -> None:
         now = time.perf_counter()
@@ -178,13 +223,11 @@ class GameWindow(QWidget):
 
         self._pulse_t += dt
         self._vis = self.vision_shared.snapshot()
-        if self.hand_mode != "auto":
-            # manual override: keep only the chosen hand, downstream code paths
-            # (calibration, trails, cursors, preview dots) then all agree
-            self._vis = (
-                [b for b in self._vis[0] if b.side == self.hand_mode],
-                *self._vis[1:],
-            )
+        blades = self._select_blades(self._vis[0], now)
+        if len(blades) != len(self._vis[0]):
+            # downstream (calibration, trails, cursors, preview dots) then all
+            # agree on which hands are in play
+            self._vis = (blades, *self._vis[1:])
         if self._vis[0]:
             self._last_blade_t = now
         self._update_calibration(now)
@@ -588,7 +631,7 @@ class GameWindow(QWidget):
             p.setPen(QColor(255, 120, 90))
         p.drawText(16, 70, f"vision: {status}   {vis_hz} Hz   infer {infer_ms:4.1f} ms   blades {n_blades}")
         p.setPen(QColor(150, 150, 150))
-        p.drawText(16, 92, f"用手：{HAND_MODE_LABELS[self.hand_mode]}   按键 H 切换 / 1 左手 / 2 右手 / 3 自动")
+        p.drawText(16, 92, f"用手：{HAND_MODE_LABELS[self.hand_mode]}   按键 H 切换单手/双手，1 单手 / 2 双手 / 3 左手 / 4 右手")
         p.setPen(QColor(255, 230, 140))
         p.drawText(16, 114, self.state.hud())
 

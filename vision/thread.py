@@ -46,6 +46,9 @@ IDLE_S = 2.0  # a hand not moving for this long counts as put down...
 IDLE_SPEED = 0.004  # ...where "moving" means this much of the frame per sample
 SPEED_ALPHA = 0.12  # smoothing for the per-hand speed estimate
 SMOOTH_ALPHA = 0.55  # palm-centre EMA: pose jitter would otherwise wobble the blade
+MAX_JUMP = 0.22  # per-sample displacement that cannot be a real hand moving
+TELEPORT_DROP_S = 0.6  # a hand that keeps teleporting for this long is not a hand
+TELEPORT_BLOCK_S = 1.5  # ...and is not re-acquired until this long after the drop
 _DEBUG_HANDS = os.environ.get("AIRFRUIT_DEBUG_HANDS", "").lower() in ("1", "true", "yes", "on")
 CAMERA_W, CAMERA_H = 1280, 720
 FIRST_FRAME_TIMEOUT_S = 1.5  # give a backend this long to deliver its first frame
@@ -66,6 +69,8 @@ class VisionThread(QThread):
         # per-side tracking state, keyed "left"/"right":
         # {x, y, seen, anchor_x, anchor_y, anchor_t}
         self._hands: dict[str, dict] = {}
+        # side -> time before which it may not be re-acquired (it was teleporting)
+        self._blocked: dict[str, float] = {}
         self._noted: dict[str, str] = {}  # debug: last printed state per side
 
     # ---- public ----
@@ -153,10 +158,17 @@ class VisionThread(QThread):
         * a hand motionless for IDLE_S counts as put down (a resting hand on the
           desk is almost perfectly still). Any movement brings it straight back;
         * a hand that drops out keeps coasting for HAND_HOLD_S so a one-frame
-          detection gap does not make the blade blink.
+          detection gap does not make the blade blink;
+        * a sample that jumps impossibly far (MAX_JUMP per frame) is a pose
+          estimate rather than a hand: the point is held, and a hand that keeps
+          doing it for TELEPORT_DROP_S is dropped. This is what stops the
+          "invented second hand jittering around the screen".
         """
         out: dict[str, BladePoint] = {}
+        refreshed: set[str] = set()  # saw this hand in this frame at all
         for side, wrist_i, pinky_i, index_i in PALM_TRIPLES:
+            if now < self._blocked.get(side, 0.0):
+                continue  # dropped for teleporting moments ago: leave it out
             w, p, q = lms[wrist_i], lms[pinky_i], lms[index_i]
             vis = min(w.visibility, p.visibility, q.visibility)
             st = self._hands.get(side)
@@ -166,6 +178,7 @@ class VisionThread(QThread):
             if not self._is_raised(lms, side, w.y, acquiring=st is None):
                 self._note(side, "lowered (wrist below elbow)")
                 continue
+            refreshed.add(side)
             # palm centre: wrist + the two knuckles average to the middle of the
             # palm, unlike the finger midpoint used earlier
             cx = (w.x + p.x + q.x) / 3.0
@@ -185,6 +198,24 @@ class VisionThread(QThread):
                 # jitters by a fraction of a percent, a playing one covers whole
                 # percent per frame. This, not raw position, separates the two.
                 step = math.hypot(cx - st["rx"], cy - st["ry"])
+                if step > MAX_JUMP:
+                    # A pose model asked for one person still estimates the arm it
+                    # cannot see; that estimate jumps between frames. A real hand
+                    # cannot cross a fifth of the frame in 33 ms (a fast slice is
+                    # ~0.08). Hold the last good point instead of following it, and
+                    # drop the hand entirely if the jumps never stop.
+                    if st.get("tele_since") is None:
+                        st["tele_since"] = now
+                    if now - st["tele_since"] >= TELEPORT_DROP_S:
+                        del self._hands[side]
+                        self._blocked[side] = now + TELEPORT_BLOCK_S
+                        self._note(side, f"teleporting jump={step:.2f} -> dropped")
+                        continue
+                    st["seen"] = now
+                    out[side] = BladePoint(x=st["x"], y=st["y"], visibility=vis, side=side)
+                    self._note(side, f"held jump={step:.2f}")
+                    continue
+                st["tele_since"] = None
                 st["speed"] += (step - st["speed"]) * SPEED_ALPHA
                 st["rx"], st["ry"] = cx, cy
                 st["x"] += (cx - st["x"]) * SMOOTH_ALPHA
@@ -199,7 +230,10 @@ class VisionThread(QThread):
                 self._note(side, f"idle vis={vis:.2f} speed={st['speed']:.4f}")
         # coast / retire hands that were not refreshed this frame
         for side, st in list(self._hands.items()):
-            if side in out:
+            if side in out or side in refreshed:
+                # refreshed but idle: deliberately not a blade, do not coast it
+                if side not in out and now - st["seen"] > HAND_HOLD_S:
+                    del self._hands[side]
                 continue
             if now - st["seen"] <= HAND_HOLD_S:
                 out[side] = BladePoint(x=st["x"], y=st["y"], visibility=0.0, side=side)
